@@ -3,3 +3,10 @@ __pycache__
 
 wan_models
 checkpoints
+data
+logs
+videos/*
+!videos/.gitkeep
+
+# downloaded, 150 MB
+prompts/vidprom_filtered_extended.txt

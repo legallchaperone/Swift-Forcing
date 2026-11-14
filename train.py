@@ -1,13 +1,21 @@
 import argparse
 import os
-from omegaconf import OmegaConf
-import wandb
 
-from trainer import DiffusionTrainer, GANTrainer, ODETrainer, ScoreDistillationTrainer
+import wandb
+from omegaconf import OmegaConf
+
+from trainer import DMDTrainer, ODETrainer
+
+TRAINERS = {
+    "ode": ODETrainer,  # ODE initialization, baseline and Swift
+    "dmd": DMDTrainer,  # Self Forcing training with DMD
+}
 
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="Any other argument is a config override of the form key=value, "
+                    "for example: swift_alpha=0.5 max_iters=3000")
     parser.add_argument("--config_path", type=str, required=True)
     parser.add_argument("--no_save", action="store_true")
     parser.add_argument("--no_visualize", action="store_true")
@@ -15,30 +23,31 @@ def main():
     parser.add_argument("--wandb-save-dir", type=str, default="", help="Path to the directory to save wandb logs")
     parser.add_argument("--disable-wandb", action="store_true")
 
-    args = parser.parse_args()
+    args, overrides = parser.parse_known_args()
+    # parse_known_args does not reject unknown flags, so check them here: a mistyped
+    # flag such as `--no-save` must fail and not become a config key.
+    for item in overrides:
+        key = item.split("=", 1)[0]
+        if item.startswith("-") or "=" not in item or not key:
+            parser.error(f"unrecognized argument '{item}': flags are listed in --help, "
+                         f"and config overrides have the form key=value")
 
-    config = OmegaConf.load(args.config_path)
-    default_config = OmegaConf.load("configs/default_config.yaml")
-    config = OmegaConf.merge(default_config, config)
+    # Later sources win: default config < config file < key=value overrides < flags
+    config = OmegaConf.merge(
+        OmegaConf.load("configs/default_config.yaml"),
+        OmegaConf.load(args.config_path),
+        OmegaConf.from_dotlist(overrides),
+    )
+    config.config_name = os.path.basename(args.config_path).split(".")[0]
     config.no_save = args.no_save
     config.no_visualize = args.no_visualize
-
-    # get the filename of config_path
-    config_name = os.path.basename(args.config_path).split(".")[0]
-    config.config_name = config_name
     config.logdir = args.logdir
     config.wandb_save_dir = args.wandb_save_dir
     config.disable_wandb = args.disable_wandb
 
-    if config.trainer == "diffusion":
-        trainer = DiffusionTrainer(config)
-    elif config.trainer == "gan":
-        trainer = GANTrainer(config)
-    elif config.trainer == "ode":
-        trainer = ODETrainer(config)
-    elif config.trainer == "score_distillation":
-        trainer = ScoreDistillationTrainer(config)
-    trainer.train()
+    if config.trainer not in TRAINERS:
+        parser.error(f"unknown trainer '{config.trainer}' (choose from {list(TRAINERS)})")
+    TRAINERS[config.trainer](config).train()
 
     wandb.finish()
 

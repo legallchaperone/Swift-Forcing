@@ -1,6 +1,6 @@
 from utils.distributed import launch_distributed_job
-from utils.scheduler import FlowMatchScheduler
-from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder
+from networks.scheduler import FlowMatchScheduler
+from networks.wrappers import WanDiffusionWrapper, WanTextEncoder
 from utils.dataset import TextDataset
 import torch.distributed as dist
 from tqdm import tqdm

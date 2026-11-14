@@ -1,109 +1,126 @@
-<p align="center">
-<h1 align="center">Self Forcing</h1>
-<h3 align="center">Bridging the Train-Test Gap in Autoregressive Video Diffusion</h3>
-</p>
-<p align="center">
-  <p align="center">
-    <a href="https://www.xunhuang.me/">Xun Huang</a><sup>1</sup>
-    ·
-    <a href="https://zhengqili.github.io/">Zhengqi Li</a><sup>1</sup>
-    ·
-    <a href="https://guandehe.github.io/">Guande He</a><sup>2</sup>
-    ·
-    <a href="https://mingyuanzhou.github.io/">Mingyuan Zhou</a><sup>2</sup>
-    ·
-    <a href="https://research.adobe.com/person/eli-shechtman/">Eli Shechtman</a><sup>1</sup><br>
-    <sup>1</sup>Adobe Research <sup>2</sup>UT Austin
-  </p>
-  <h3 align="center"><a href="https://arxiv.org/abs/2506.08009">Paper</a> | <a href="https://self-forcing.github.io">Website</a> | <a href="https://huggingface.co/gdhe17/Self-Forcing/tree/main">Models (HuggingFace)</a></h3>
-</p>
+# Swift on the ODE initialization of Self Forcing
 
----
+This repository applies Swift (https://www.alphaxiv.org/pdf/2610.25844) to the ODE initialization stage of
+[Self Forcing](https://arxiv.org/abs/2506.08009). It is a reduced fork of the
+[Self Forcing code](https://github.com/guandeh17/Self-Forcing): only the text-to-video path for
+ODE initialization, Self Forcing training with DMD, and inference remains.
 
-Self Forcing trains autoregressive video diffusion models by **simulating the inference process during training**, performing autoregressive rollout with KV caching. It resolves the train-test distribution mismatch and enables **real-time, streaming video generation on a single RTX 4090** while matching the quality of state-of-the-art diffusion models.
+The ODE initialization trains the few-step causal student `G` to regress the ODE solution `y` of the teacher:
 
----
+    baseline:  || G(x_t, t) - y ||^2
+    Swift:     || G(x_t, t) - [ y + alpha * (y - G_weak(x_t, t)) ] ||^2
 
+`G_weak` is a frozen early checkpoint of the same student.
 
-https://github.com/user-attachments/assets/7548c2db-fe03-4ba8-8dd3-52d2c6160739
+## Layout
 
+The code has four layers. Each layer calls only the layers below it.
 
-## Requirements
-We tested this repo on the following setup:
-* Nvidia GPU with at least 24 GB memory (RTX 4090, A100, and H100 are tested).
-* Linux operating system.
-* 64 GB RAM.
+| Layer | Path | Content |
+| --- | --- | --- |
+| Entry points | `train.py` | Reads a config file and `key=value` overrides, then starts a trainer. |
+| | `inference.py` | Generates videos from a checkpoint. |
+| Trainers | `trainer/base.py` | The run plumbing that both stages share: setup, seed, config record, checkpoints, resume, gradient accumulation, metrics. |
+| | `trainer/ode.py` | One update of the ODE initialization. |
+| | `trainer/dmd.py` | One step of Self Forcing training with DMD. |
+| Losses | `losses/ode_regression.py` | The ODE regression loss and the Swift target. **The research code is here.** |
+| | `losses/dmd.py`, `losses/base.py` | The DMD loss. |
+| Networks | `networks/wrappers.py`, `networks/scheduler.py` | The generator, text encoder and VAE, and the noise schedule. |
+| | `networks/rollout.py`, `networks/sampler.py` | Autoregressive generation: for DMD training, and for inference. |
+| | `wan/` | The Wan2.1 network code, not edited. |
 
-Other hardware setup could also work but hasn't been tested.
+Other folders:
 
-## Installation
-Create a conda environment and install dependencies:
-```
-conda create -n self_forcing python=3.10 -y
-conda activate self_forcing
-pip install -r requirements.txt
-pip install flash-attn --no-build-isolation
-python setup.py develop
-```
+| Path | Content |
+| --- | --- |
+| `configs/` | `self_forcing_ode.yaml` (ODE initialization, baseline and Swift) and `self_forcing_dmd.yaml`. |
+| `utils/` | Helpers: checkpoint folders, data sets, FSDP, LMDB. |
+| `scripts/` | Generation of ODE pairs from the teacher. |
+| `slurm/` | Job scripts for DeltaAI. |
+| `paper/` | The paper (ICML 2026 template). |
 
-## Quick Start
-### Download checkpoints
-```
-huggingface-cli download Wan-AI/Wan2.1-T2V-1.3B --local-dir-use-symlinks False --local-dir wan_models/Wan2.1-T2V-1.3B
-huggingface-cli download gdhe17/Self-Forcing checkpoints/self_forcing_dmd.pt --local-dir .
-```
+To add a training stage, write a loss module in `losses/` and a subclass of `BaseTrainer`
+with `build()` and `train_one_step()`. Then add it to `TRAINERS` in `train.py`.
 
-### GUI demo
-```
-python demo.py
-```
-Note:
-* **Our model works better with long, detailed prompts** since it's trained with such prompts. We will integrate prompt extension into the codebase (similar to [Wan2.1](https://github.com/Wan-Video/Wan2.1/tree/main?tab=readme-ov-file#2-using-prompt-extention)) in the future. For now, it is recommended to use third-party LLMs (such as GPT-4o) to extend your prompt before providing to the model.
-* You may want to adjust FPS so it plays smoothly on your device.
-* The speed can be improved by enabling `torch.compile`, [TAEHV-VAE](https://github.com/madebyollin/taehv/), or using FP8 Linear layers, although the latter two options may sacrifice quality. It is recommended to use `torch.compile` if possible and enable TAEHV-VAE if further speedup is needed.
+## Setup
 
-### CLI Inference
-Example inference script using the chunk-wise autoregressive checkpoint trained with DMD:
-```
-python inference.py \
-    --config_path configs/self_forcing_dmd.yaml \
-    --output_folder videos/self_forcing_dmd \
-    --checkpoint_path checkpoints/self_forcing_dmd.pt \
-    --data_path prompts/MovieGenVideoBench_extended.txt \
-    --use_ema
-```
-Other config files and corresponding checkpoints can be found in [configs](configs) folder and our [huggingface repo](https://huggingface.co/gdhe17/Self-Forcing/tree/main/checkpoints).
+    huggingface-cli download Wan-AI/Wan2.1-T2V-1.3B --local-dir wan_models/Wan2.1-T2V-1.3B
 
-## Training
-### Download text prompts and ODE initialized checkpoint
-```
-huggingface-cli download gdhe17/Self-Forcing checkpoints/ode_init.pt --local-dir .
-huggingface-cli download gdhe17/Self-Forcing vidprom_filtered_extended.txt --local-dir prompts
-```
-Note: Our training algorithm (except for the GAN version) is data-free (**no video data is needed**). For now, we directly provide the ODE initialization checkpoint and will add more instructions on how to perform ODE initialization in the future (which is identical to the process described in the [CausVid](https://github.com/tianweiy/CausVid) repo).
+The ODE pairs are in `data/ode_pairs_16k_shift5` (from `zhengqili/Self-Forcing-Data`).
+`slurm/env.sh` sets the container and the Python environment.
 
-### Self Forcing Training with DMD
-```
-torchrun --nnodes=8 --nproc_per_node=8 --rdzv_id=5235 \
-  --rdzv_backend=c10d \
-  --rdzv_endpoint $MASTER_ADDR \
-  train.py \
-  --config_path configs/self_forcing_dmd.yaml \
-  --logdir logs/self_forcing_dmd \
-  --disable-wandb
-```
-Our training run uses 600 iterations and completes in under 2 hours using 64 H100 GPUs. By implementing gradient accumulation, it should be possible to reproduce the results in less than 16 hours using 8 H100 GPUs.
+## The experiment
+
+The baseline and the Swift run both start from the step-750 checkpoint of one shared run.
+Thus they differ only in the regression target.
+
+| Stage | Steps | Target | Output |
+| --- | --- | --- | --- |
+| `shared` | 0 to 750 | plain | `logs/ode_shared` |
+| `baseline` | 750 to 3000 | plain | `logs/ode_baseline` |
+| `swift` | 750 to 3000 | Swift, weak model = step 750 of `shared` | `logs/ode_swift` |
+
+    mkdir -p logs/slurm
+    sbatch --export=ALL,STAGE=shared --time=14:00:00 slurm/train_ode.sbatch
+    sbatch --export=ALL,STAGE=baseline slurm/train_ode.sbatch
+    sbatch --export=ALL,STAGE=swift    slurm/train_ode.sbatch
+    sbatch --export=ALL,STAGE=swift,OVERRIDES="swift_alpha=0.5",LOGDIR=logs/ode_swift_a0.5 slurm/train_ode.sbatch
+
+Without Slurm, the Swift stage is this command:
+
+    torchrun --nproc_per_node=4 train.py --config_path configs/self_forcing_ode.yaml \
+        --logdir logs/ode_swift --disable-wandb --no_visualize \
+        resume_from=logs/ode_shared/checkpoint_model_000750 \
+        weak_generator_ckpt=logs/ode_shared/checkpoint_model_000750/model.pt \
+        swift_alpha=0.25
+
+### Output of a run
+
+    logs/ode_swift/
+      config_from_step_000750.yaml       the settings of the launch that started at step 750
+      metrics.jsonl                      one line per optimizer update
+      checkpoint_model_001000/model.pt       {"generator": weights after 1000 updates}
+      checkpoint_model_001000/optimizer.pt   {"generator": AdamW state}
+
+Compare runs with `loss_to_y` in `metrics.jsonl`. It is the distance to the plain target `y`
+in every run. `generator_loss` is the distance to the Swift target when Swift is on.
+
+### Resume
+
+These rules are the same for both training stages.
+
+- A job that is started again with the same `--logdir` continues from its newest checkpoint.
+- `resume_from=<checkpoint folder>` starts a run from a checkpoint of another run: weights, AdamW state and step count.
+- The data order and the timestep draws depend only on `seed` and the step count. A resumed run sees the same data as an uninterrupted run.
+- The trainer keeps `optimizer.pt` only for the newest checkpoint and for the steps in `keep_optimizer_steps`. `model.pt` stays for every checkpoint.
+
+## After the ODE initialization
+
+Self Forcing training with DMD, from an ODE-initialized checkpoint:
+
+    torchrun --nproc_per_node=4 train.py --config_path configs/self_forcing_dmd.yaml \
+        --logdir logs/dmd_swift --disable-wandb \
+        generator_ckpt=logs/ode_swift/checkpoint_model_003000/model.pt max_iters=600
+
+- The teacher is Wan2.1-T2V-14B (`real_name` in the config). Download it to `wan_models/Wan2.1-T2V-14B`.
+- The prompts are `prompts/vidprom_filtered_extended.txt` from `gdhe17/Self-Forcing`.
+- An update uses `total_batch_size: 64` samples. On 4 GPUs the trainer accumulates the gradients of 16 batches for each update.
+- `model.pt` holds the keys `generator`, `critic`, and `generator_ema` (after step `ema_start_step`).
+
+Video generation:
+
+    python inference.py --config_path configs/self_forcing_dmd.yaml \
+        --checkpoint_path logs/dmd_swift/checkpoint_model_000600/model.pt \
+        --data_path prompts/MovieGenVideoBench_extended.txt \
+        --output_folder videos/dmd_swift --use_ema
+
+## Removed from the original code
+
+The interactive demo, the GAN, SiD and CausVid losses, the diffusion (teacher forcing) trainer,
+the bidirectional and multi-step inference pipelines, and the Wan modules that only they used.
+`git show 33593df:<path>` prints an original file.
 
 ## Acknowledgements
-This codebase is built on top of the open-source implementation of [CausVid](https://github.com/tianweiy/CausVid) by [Tianwei Yin](https://tianweiy.github.io/) and the [Wan2.1](https://github.com/Wan-Video/Wan2.1) repo.
 
-## Citation
-If you find this codebase useful for your research, please kindly cite our paper:
-```
-@article{huang2025selfforcing,
-  title={Self Forcing: Bridging the Train-Test Gap in Autoregressive Video Diffusion},
-  author={Huang, Xun and Li, Zhengqi and He, Guande and Zhou, Mingyuan and Shechtman, Eli},
-  journal={arXiv preprint arXiv:2506.08009},
-  year={2025}
-}
-```
+This code is built on [Self Forcing](https://github.com/guandeh17/Self-Forcing) (Huang et al., 2025),
+which is built on [CausVid](https://github.com/tianweiy/CausVid) and [Wan2.1](https://github.com/Wan-Video/Wan2.1).

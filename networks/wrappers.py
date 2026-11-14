@@ -3,7 +3,7 @@ from typing import List, Optional
 import torch
 from torch import nn
 
-from utils.scheduler import SchedulerInterface, FlowMatchScheduler
+from networks.scheduler import SchedulerInterface, FlowMatchScheduler
 from wan.modules.tokenizers import HuggingfaceTokenizer
 from wan.modules.model import WanModel, RegisterTokens, GanAttentionBlock
 from wan.modules.vae import _video_vae

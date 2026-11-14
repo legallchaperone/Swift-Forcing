@@ -1,242 +1,164 @@
-import gc
-import logging
-from utils.dataset import ODERegressionLMDBDataset, cycle
-from model import ODERegression
-from collections import defaultdict
-from utils.misc import (
-    set_seed
-)
-import torch.distributed as dist
-from omegaconf import OmegaConf
+import contextlib
+
 import torch
+import torch.distributed as dist
 import wandb
-import time
-import os
 
-from utils.distributed import barrier, fsdp_wrap, fsdp_state_dict, launch_distributed_job
+from losses import ODERegression
+from trainer.base import BaseTrainer
+from utils.dataset import ODERegressionLMDBDataset, ResumableDistributedSampler, resumable_cycle
+
+MAX_GRAD_NORM = 10.0
 
 
-class Trainer:
-    def __init__(self, config):
-        self.config = config
-        self.step = 0
+class Trainer(BaseTrainer):
+    """
+    ODE initialization (CausVid Sec 4.3), with the optional Swift target.
+    One step is one update of the student. See BaseTrainer for checkpoints and resume.
 
-        # Step 1: Initialize the distributed training environment (rank, seed, dtype, logging etc.)
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
+    Config keys in addition to the ones of BaseTrainer (see configs/self_forcing_ode.yaml):
+        grad_accum_no_sync    skip the gradient communication on all but the last
+                              micro-batch of an update (default true; it keeps one
+                              unsharded fp32 gradient copy per GPU, about 6 GB)
+        swift_alpha, weak_generator_ckpt   see losses/ode_regression.py
 
-        launch_distributed_job()
-        global_rank = dist.get_rank()
-        self.world_size = dist.get_world_size()
+    The data order depends only on the seed and the step count. So the baseline and
+    the Swift run see the same data, and a resumed run sees the same data as an
+    uninterrupted one.
+    """
 
-        self.dtype = torch.bfloat16 if config.mixed_precision else torch.float32
-        self.device = torch.cuda.current_device()
-        self.is_main_process = global_rank == 0
-        self.disable_wandb = config.disable_wandb
+    def build(self):
+        config = self.config
 
-        # use a random seed for the training
-        if config.seed == 0:
-            random_seed = torch.randint(0, 10000000, (1,), device=self.device)
-            dist.broadcast(random_seed, src=0)
-            config.seed = random_seed.item()
-
-        set_seed(config.seed + global_rank)
-
-        if self.is_main_process and not self.disable_wandb:
-            wandb.login(host=config.wandb_host, key=config.wandb_key)
-            wandb.init(
-                config=OmegaConf.to_container(config, resolve=True),
-                name=config.config_name,
-                mode="online",
-                entity=config.wandb_entity,
-                project=config.wandb_project,
-                dir=config.wandb_save_dir
-            )
-
-        self.output_path = config.logdir
-
-        # Step 2: Initialize the model and optimizer
-
+        # Step 1: The loss module and its networks
         assert config.distribution_loss == "ode", "Only ODE loss is supported for ODE training"
         self.model = ODERegression(config, device=self.device)
+        self.model.generator = self.fsdp(self.model.generator, config.generator_fsdp_wrap_strategy)
+        self.model.text_encoder = self.fsdp(
+            self.model.text_encoder, config.text_encoder_fsdp_wrap_strategy,
+            cpu_offload=config.get("text_encoder_cpu_offload", False))
+        if self.model.weak_generator is not None:
+            # Frozen and used without gradients, so it needs no FSDP wrapper. Use the
+            # precision of the FSDP student: parameters in self.dtype, buffers in fp32.
+            self.model.weak_generator = self.model.weak_generator.to(device=self.device)
+            for param in self.model.weak_generator.parameters():
+                param.data = param.data.to(self.dtype)
 
-        self.model.generator = fsdp_wrap(
-            self.model.generator,
-            sharding_strategy=config.sharding_strategy,
-            mixed_precision=config.mixed_precision,
-            wrap_strategy=config.generator_fsdp_wrap_strategy
-        )
-        self.model.text_encoder = fsdp_wrap(
-            self.model.text_encoder,
-            sharding_strategy=config.sharding_strategy,
-            mixed_precision=config.mixed_precision,
-            wrap_strategy=config.text_encoder_fsdp_wrap_strategy,
-            cpu_offload=getattr(config, "text_encoder_cpu_offload", False)
-        )
+        self.visualize = not config.no_visualize and not self.disable_wandb and self.is_main_process
+        if self.visualize or config.load_raw_video:
+            self.model.vae = self.model.vae.to(device=self.device, dtype=self.dtype)
 
-        if not config.no_visualize or config.load_raw_video:
-            self.model.vae = self.model.vae.to(
-                device=self.device, dtype=torch.bfloat16 if config.mixed_precision else torch.float32)
+        self.modules = {"generator": self.model.generator}
+        self.optimizers = {
+            "generator": self.adamw(self.model.generator, config.lr, (config.beta1, config.beta2))}
 
-        self.generator_optimizer = torch.optim.AdamW(
-            [param for param in self.model.generator.parameters()
-             if param.requires_grad],
-            lr=config.lr,
-            betas=(config.beta1, config.beta2),
-            weight_decay=config.weight_decay
-        )
-
-        # Step 3: Initialize the dataloader
+        # Step 2: The data. On resume, skip the micro-batches that the first start_step updates used.
         dataset = ODERegressionLMDBDataset(
-            config.data_path, max_pair=getattr(config, "max_pair", int(1e8)))
-        sampler = torch.utils.data.distributed.DistributedSampler(
-            dataset, shuffle=True, drop_last=True)
+            config.data_path, max_pair=config.get("max_pair", int(1e8)))
+        sampler = ResumableDistributedSampler(
+            dataset, shuffle=True, drop_last=True, seed=config.seed)
         dataloader = torch.utils.data.DataLoader(
-            dataset, batch_size=config.batch_size, sampler=sampler, num_workers=8)
-        total_batch_size = getattr(config, "total_batch_size", None)
-        if total_batch_size is not None:
-            assert total_batch_size == config.batch_size * self.world_size, "Gradient accumulation is not supported for ODE training"
-        self.dataloader = cycle(dataloader)
-
-        self.step = 0
-
-        ##############################################################################################################
-        # 7. (If resuming) Load the model and optimizer, lr_scheduler, ema's statedicts
-        if getattr(config, "generator_ckpt", False):
-            print(f"Loading pretrained generator from {config.generator_ckpt}")
-            state_dict = torch.load(config.generator_ckpt, map_location="cpu")[
-                'generator']
-            self.model.generator.load_state_dict(
-                state_dict, strict=True
-            )
-
-        ##############################################################################################################
-
-        self.max_grad_norm = 10.0
-        self.previous_time = None
-
-    def save(self):
-        print("Start gathering distributed model states...")
-        generator_state_dict = fsdp_state_dict(
-            self.model.generator)
-        state_dict = {
-            "generator": generator_state_dict
-        }
-
+            dataset, batch_size=config.batch_size, sampler=sampler,
+            num_workers=config.get("num_workers", 4), drop_last=True)
+        self.dataloader = resumable_cycle(
+            dataloader, consumed_batches=self.start_step * self.grad_accum_steps)
         if self.is_main_process:
-            os.makedirs(os.path.join(self.output_path,
-                        f"checkpoint_model_{self.step:06d}"), exist_ok=True)
-            torch.save(state_dict, os.path.join(self.output_path,
-                       f"checkpoint_model_{self.step:06d}", "model.pt"))
-            print("Model saved to", os.path.join(self.output_path,
-                  f"checkpoint_model_{self.step:06d}", "model.pt"))
+            print(f"{len(dataset)} ODE pairs", flush=True)
+
+        self.grad_accum_no_sync = bool(config.get("grad_accum_no_sync", True))
+        self.num_levels = len(self.model.denoising_step_list)
+
+    def _level_sums(self, values: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
+        """Sum `values` [B, F] into one bin per denoising step."""
+        sums = torch.zeros(self.num_levels, device=values.device, dtype=torch.float32)
+        return sums.index_add_(0, index.flatten().to(values.device), values.flatten().float())
 
     def train_one_step(self):
-        VISUALIZE = self.step % 100 == 0
+        VISUALIZE = self.visualize and self.step % 100 == 0
         self.model.eval()  # prevent any randomness (e.g. dropout)
+        optimizer = self.optimizers["generator"]
 
-        # Step 1: Get the next batch of text prompts
-        batch = next(self.dataloader)
-        text_prompts = batch["prompts"]
-        ode_latent = batch["ode_latent"].to(
-            device=self.device, dtype=self.dtype)
+        # Sums over the samples of this rank. The last three have one entry per denoising step.
+        loss_sum = torch.zeros(1, device=self.device)
+        loss_to_y = torch.zeros(self.num_levels, device=self.device)
+        count = torch.zeros(self.num_levels, device=self.device)
+        weak_gap = torch.zeros(self.num_levels, device=self.device)
 
-        # Step 2: Extract the conditional infos
-        with torch.no_grad():
-            conditional_dict = self.model.text_encoder(
-                text_prompts=text_prompts)
+        optimizer.zero_grad(set_to_none=True)
+        for micro_step in range(self.grad_accum_steps):
+            # Step 1: Get the next batch of text prompts
+            batch = next(self.dataloader)
+            text_prompts = batch["prompts"]
+            ode_latent = batch["ode_latent"].to(
+                device=self.device, dtype=self.dtype)
 
-        # Step 3: Train the generator
-        generator_loss, log_dict = self.model.generator_loss(
-            ode_latent=ode_latent,
-            conditional_dict=conditional_dict
-        )
+            # Step 2: Extract the conditional infos
+            with torch.no_grad():
+                conditional_dict = self.model.text_encoder(
+                    text_prompts=text_prompts)
 
-        unnormalized_loss = log_dict["unnormalized_loss"]
-        timestep = log_dict["timestep"]
+            # Step 3: Train the generator. Only the last micro-batch reduces the
+            # gradients over the GPUs; the others accumulate them locally.
+            sync = not self.grad_accum_no_sync or micro_step == self.grad_accum_steps - 1
+            with contextlib.nullcontext() if sync else self.model.generator.no_sync():
+                generator_loss, log_dict = self.model.generator_loss(
+                    ode_latent=ode_latent,
+                    conditional_dict=conditional_dict
+                )
+                (generator_loss / self.grad_accum_steps).backward()
 
+            index = log_dict["timestep_index"]
+            loss_sum += generator_loss.detach().float()
+            loss_to_y += self._level_sums(log_dict["loss_to_y"], index)
+            count += self._level_sums(torch.ones_like(log_dict["loss_to_y"]), index)
+            if "weak_gap" in log_dict:
+                weak_gap += self._level_sums(log_dict["weak_gap"], index)
+
+        generator_grad_norm = self.model.generator.clip_grad_norm_(MAX_GRAD_NORM)
+        optimizer.step()
+
+        # Step 4: Combine the statistics of all GPUs
+        stats_tensor = torch.cat([loss_sum, loss_to_y, count, weak_gap])
         if self.world_size > 1:
-            gathered_unnormalized_loss = torch.zeros(
-                [self.world_size, *unnormalized_loss.shape],
-                dtype=unnormalized_loss.dtype, device=self.device)
-            gathered_timestep = torch.zeros(
-                [self.world_size, *timestep.shape],
-                dtype=timestep.dtype, device=self.device)
+            dist.all_reduce(stats_tensor, op=dist.ReduceOp.SUM)
+        if self.is_main_process:
+            loss_sum = stats_tensor[0]
+            loss_to_y, count, weak_gap = stats_tensor[1:].view(3, self.num_levels)
+            self._log(loss_sum, loss_to_y, count, weak_gap, generator_grad_norm)
 
-            dist.all_gather_into_tensor(
-                gathered_unnormalized_loss, unnormalized_loss)
-            dist.all_gather_into_tensor(gathered_timestep, timestep)
-        else:
-            gathered_unnormalized_loss = unnormalized_loss
-            gathered_timestep = timestep
-
-        loss_breakdown = defaultdict(list)
-        stats = {}
-
-        for index, t in enumerate(timestep):
-            loss_breakdown[str(int(t.item()) // 250 * 250)].append(
-                unnormalized_loss[index].item())
-
-        for key_t in loss_breakdown.keys():
-            stats["loss_at_time_" + key_t] = sum(loss_breakdown[key_t]) / \
-                len(loss_breakdown[key_t])
-
-        self.generator_optimizer.zero_grad()
-        generator_loss.backward()
-        generator_grad_norm = self.model.generator.clip_grad_norm_(
-            self.max_grad_norm)
-        self.generator_optimizer.step()
-
-        # Step 4: Visualization
-        if VISUALIZE and not self.config.no_visualize and not self.config.disable_wandb and self.is_main_process:
-            # Visualize the input, output, and ground truth
-            input = log_dict["input"]
-            output = log_dict["output"]
-            ground_truth = ode_latent[:, -1]
-
-            input_video = self.model.vae.decode_to_pixel(input)
-            output_video = self.model.vae.decode_to_pixel(output)
-            ground_truth_video = self.model.vae.decode_to_pixel(ground_truth)
-            input_video = 255.0 * (input_video.cpu().numpy() * 0.5 + 0.5)
-            output_video = 255.0 * (output_video.cpu().numpy() * 0.5 + 0.5)
-            ground_truth_video = 255.0 * (ground_truth_video.cpu().numpy() * 0.5 + 0.5)
-
-            # Visualize the input, output, and ground truth
+        # Step 5: Visualization
+        if VISUALIZE:
+            # Visualize the input, output, and ground truth of the last batch
+            videos = {
+                "input": log_dict["input"],
+                "output": log_dict["output"],
+                "ground_truth": ode_latent[:, -1],
+            }
             wandb.log({
-                "input": wandb.Video(input_video, caption="Input", fps=16, format="mp4"),
-                "output": wandb.Video(output_video, caption="Output", fps=16, format="mp4"),
-                "ground_truth": wandb.Video(ground_truth_video, caption="Ground Truth", fps=16, format="mp4"),
+                name: wandb.Video(
+                    255.0 * (self.model.vae.decode_to_pixel(latent).cpu().numpy() * 0.5 + 0.5),
+                    caption=name, fps=16, format="mp4")
+                for name, latent in videos.items()
             }, step=self.step)
 
-        # Step 5: Logging
-        if self.is_main_process and not self.disable_wandb:
-            wandb_loss_dict = {
-                "generator_loss": generator_loss.item(),
-                "generator_grad_norm": generator_grad_norm.item(),
-                **stats
-            }
-            wandb.log(wandb_loss_dict, step=self.step)
-
-        if self.step % self.config.gc_interval == 0:
-            if dist.get_rank() == 0:
-                logging.info("DistGarbageCollector: Running GC.")
-            gc.collect()
-
-    def train(self):
-        while True:
-            self.train_one_step()
-            if (not self.config.no_save) and self.step % self.config.log_iters == 0:
-                self.save()
-                torch.cuda.empty_cache()
-
-            barrier()
-            if self.is_main_process:
-                current_time = time.time()
-                if self.previous_time is None:
-                    self.previous_time = current_time
-                else:
-                    if not self.disable_wandb:
-                        wandb.log({"per iteration time": current_time - self.previous_time}, step=self.step)
-                    self.previous_time = current_time
-
-            self.step += 1
+    def _log(self, loss_sum, loss_to_y, count, weak_gap, generator_grad_norm):
+        """Turn the sums over all GPUs into the metrics of this update."""
+        total = count.sum().clamp(min=1)
+        stats = {
+            # the training loss (against the Swift target when Swift is on)
+            "generator_loss": (loss_sum / (self.grad_accum_steps * self.world_size)).item(),
+            # the distance to the plain ODE target y: compare runs with this value
+            "loss_to_y": (loss_to_y.sum() / total).item(),
+            "generator_grad_norm": generator_grad_norm.item(),
+        }
+        per_level = {"loss_to_y": loss_to_y}
+        if self.model.weak_generator is not None:
+            # the distance of the weak model to y
+            stats["weak_loss_to_y"] = (weak_gap.sum() / total).item()
+            per_level["weak_loss_to_y"] = weak_gap
+        timesteps = self.model.denoising_step_list.tolist()
+        for name, sums in per_level.items():
+            for level in range(self.num_levels):
+                if count[level] > 0:
+                    stats[f"{name}_at_time_{timesteps[level]:.0f}"] = (sums[level] / count[level]).item()
+        self.log(stats, show=("generator_loss", "loss_to_y", "weak_loss_to_y"))

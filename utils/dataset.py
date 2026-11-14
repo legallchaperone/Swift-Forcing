@@ -35,15 +35,36 @@ class TextDataset(Dataset):
 
 
 class ODERegressionLMDBDataset(Dataset):
-    def __init__(self, data_path: str, max_pair: int = int(1e8)):
-        self.env = lmdb.open(data_path, readonly=True,
-                             lock=False, readahead=False, meminit=False)
+    def __init__(self, data_path: str, max_pair: int = int(1e8), min_pair: int = 0):
+        """
+        Use the pairs with index in [min_pair, max_pair). A held-out set is the
+        range that training does not use.
+        """
+        self.data_path = data_path
+        self._env = None  # opened on first use, so that each dataloader worker has its own handle
 
-        self.latents_shape = get_array_shape_from_lmdb(self.env, 'latents')
+        env = self._open()
+        self.latents_shape = get_array_shape_from_lmdb(env, 'latents')
+        env.close()
         self.max_pair = max_pair
+        self.min_pair = min_pair
+        end = min(self.latents_shape[0], max_pair)
+        assert 0 <= min_pair < end, (
+            f"empty pair range [{min_pair}, {end}): the database has "
+            f"{self.latents_shape[0]} pairs and max_pair is {max_pair}")
+
+    def _open(self):
+        return lmdb.open(self.data_path, readonly=True,
+                         lock=False, readahead=False, meminit=False)
+
+    @property
+    def env(self):
+        if self._env is None:
+            self._env = self._open()
+        return self._env
 
     def __len__(self):
-        return min(self.latents_shape[0], self.max_pair)
+        return min(self.latents_shape[0], self.max_pair) - self.min_pair
 
     def __getitem__(self, idx):
         """
@@ -51,6 +72,7 @@ class ODERegressionLMDBDataset(Dataset):
             - prompts: List of Strings
             - latents: Tensor of shape (num_denoising_steps, num_frames, num_channels, height, width). It is ordered from pure noise to clean image.
         """
+        idx = idx + self.min_pair
         latents = retrieve_row_from_lmdb(
             self.env,
             "latents", np.float16, idx, shape=self.latents_shape[1:]
@@ -214,7 +236,34 @@ class TextImagePairDataset(Dataset):
         }
 
 
-def cycle(dl):
+class ResumableDistributedSampler(torch.utils.data.distributed.DistributedSampler):
+    """A DistributedSampler that can leave out the first `skip_samples` indices of an epoch."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.skip_samples = 0
+
+    def __iter__(self):
+        return iter(list(super().__iter__())[self.skip_samples:])
+
+    def __len__(self):
+        return self.num_samples - self.skip_samples
+
+
+def resumable_cycle(dataloader, consumed_batches: int = 0):
+    """
+    Yield batches forever, with a new shuffle for every pass over the data. Start after
+    the first `consumed_batches` batches, so that a resumed run continues the data order
+    of the run that it resumes. The dataloader must use a ResumableDistributedSampler.
+    """
+    sampler = dataloader.sampler
+    batches_per_epoch = len(sampler) // dataloader.batch_size
+    assert batches_per_epoch > 0, "the dataset is smaller than one batch per GPU"
+    epoch, skip_batches = divmod(consumed_batches, batches_per_epoch)
+    sampler.skip_samples = skip_batches * dataloader.batch_size
     while True:
-        for data in dl:
-            yield data
+        sampler.set_epoch(epoch)
+        yield from dataloader
+        sampler.skip_samples = 0
+        epoch += 1
+

@@ -3,7 +3,7 @@ from functools import partial
 import os
 import torch
 import torch.distributed as dist
-from torch.distributed.fsdp import FullStateDictConfig, FullyShardedDataParallel as FSDP, MixedPrecision, ShardingStrategy, StateDictType
+from torch.distributed.fsdp import FullOptimStateDictConfig, FullStateDictConfig, FullyShardedDataParallel as FSDP, MixedPrecision, ShardingStrategy, StateDictType
 from torch.distributed.fsdp.api import CPUOffload
 from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy, transformer_auto_wrap_policy
 
@@ -18,6 +18,24 @@ def fsdp_state_dict(model):
         checkpoint = model.state_dict()
 
     return checkpoint
+
+
+def fsdp_optim_state_dict(model, optimizer):
+    """Gather the full (unsharded) optimizer state onto the CPU of rank 0."""
+    with FSDP.state_dict_type(
+        model, StateDictType.FULL_STATE_DICT,
+        FullStateDictConfig(offload_to_cpu=True, rank0_only=True),
+        FullOptimStateDictConfig(offload_to_cpu=True, rank0_only=True)
+    ):
+        return FSDP.optim_state_dict(model, optimizer)
+
+
+def fsdp_load_optim_state_dict(model, optimizer, optim_state_dict):
+    """Load a full optimizer state (read by every rank) into the shard of this rank."""
+    optimizer.load_state_dict(
+        FSDP.optim_state_dict_to_load(
+            model=model, optim=optimizer, optim_state_dict=optim_state_dict)
+    )
 
 
 def fsdp_wrap(module, sharding_strategy="full", mixed_precision=False, wrap_strategy="size", min_num_params=int(5e7), transformer_module=None, cpu_offload=False):

@@ -4,12 +4,17 @@ from torch import nn
 import torch.distributed as dist
 import torch
 
-from pipeline import SelfForcingTrainingPipeline
-from utils.loss import get_denoising_loss
-from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
+from networks.rollout import SelfForcingTrainingPipeline
+from losses.denoising import get_denoising_loss
+from networks.wrappers import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
 
 
 class BaseModel(nn.Module):
+    """
+    A loss module owns the networks of its training stage and computes the losses.
+    The trainer wraps the networks for distributed training and runs the optimizers.
+    """
+
     def __init__(self, args, device):
         super().__init__()
         self._initialize_models(args, device)
@@ -24,17 +29,9 @@ class BaseModel(nn.Module):
                 self.denoising_step_list = timesteps[1000 - self.denoising_step_list]
 
     def _initialize_models(self, args, device):
-        self.real_model_name = getattr(args, "real_name", "Wan2.1-T2V-1.3B")
-        self.fake_model_name = getattr(args, "fake_name", "Wan2.1-T2V-1.3B")
-
+        """Build the networks that every training stage uses."""
         self.generator = WanDiffusionWrapper(**getattr(args, "model_kwargs", {}), is_causal=True)
         self.generator.model.requires_grad_(True)
-
-        self.real_score = WanDiffusionWrapper(model_name=self.real_model_name, is_causal=False)
-        self.real_score.model.requires_grad_(False)
-
-        self.fake_score = WanDiffusionWrapper(model_name=self.fake_model_name, is_causal=False)
-        self.fake_score.model.requires_grad_(True)
 
         self.text_encoder = WanTextEncoder()
         self.text_encoder.requires_grad_(False)
@@ -96,9 +93,25 @@ class BaseModel(nn.Module):
 
 
 class SelfForcingModel(BaseModel):
+    """
+    The base of the distribution matching losses. It adds the teacher (`real_score`) and
+    the critic (`fake_score`), and it generates the student's videos with the Self Forcing rollout.
+    """
+
     def __init__(self, args, device):
         super().__init__(args, device)
         self.denoising_loss_func = get_denoising_loss(args.denoising_loss_type)()
+
+    def _initialize_models(self, args, device):
+        super()._initialize_models(args, device)
+        self.real_model_name = getattr(args, "real_name", "Wan2.1-T2V-1.3B")
+        self.fake_model_name = getattr(args, "fake_name", "Wan2.1-T2V-1.3B")
+
+        self.real_score = WanDiffusionWrapper(model_name=self.real_model_name, is_causal=False)
+        self.real_score.model.requires_grad_(False)
+
+        self.fake_score = WanDiffusionWrapper(model_name=self.fake_model_name, is_causal=False)
+        self.fake_score.model.requires_grad_(True)
 
     def _run_generator(
         self,

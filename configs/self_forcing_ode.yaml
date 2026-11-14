@@ -1,0 +1,52 @@
+# ODE initialization of the Self Forcing student (the stage before Self Forcing DMD training).
+# It follows the CausVid protocol that the Self Forcing paper cites, on the 16k ODE pairs
+# released by the Self Forcing authors (zhengqili/Self-Forcing-Data, shift 5).
+#   - 4-step student, timesteps [1000, 750, 500, 250] warped with shift 5
+#     -> noise levels 1.0, 0.9375, 0.833, 0.625, the levels stored in the data
+#   - AdamW, lr 2e-6, betas (0.9, 0.999): the released CausVid ODE config
+#   - 3000 updates: the CausVid paper and its released checkpoint
+#   - 32 samples per update (CausVid used 128; reduced for the compute budget)
+# The student starts from the Wan2.1-T2V-1.3B weights.
+# The baseline and the Swift run use this one file. A run changes a value with a
+# key=value argument of train.py, for example `swift_alpha=0.25`.
+generator_fsdp_wrap_strategy: size
+text_encoder_fsdp_wrap_strategy: size
+denoising_step_list:
+- 1000
+- 750
+- 500
+- 250
+warp_denoising_step: true # need to remove - 0 in denoising_step_list if warp_denoising_step is true
+timestep_shift: 5.0
+mixed_precision: true
+seed: 1  # fixed (0 = random), so that the baseline and the Swift run see the same data
+wandb_host: WANDB_HOST
+wandb_key: WANDB_KEY
+wandb_entity: WANDB_ENTITY
+wandb_project: WANDB_PROJECT
+sharding_strategy: hybrid_full
+lr: 2.0e-06
+beta1: 0.9
+beta2: 0.999
+weight_decay: 0.01
+data_path: data/ode_pairs_16k_shift5
+max_pair: 15872  # train on pairs [0, 15872); the last 128 pairs are held out for evaluation
+batch_size: 1          # per GPU
+total_batch_size: 32   # per update, reached with gradient accumulation
+num_workers: 4
+max_iters: 3000
+log_iters: 250         # checkpoint interval
+keep_optimizer_steps:   # checkpoints that keep their AdamW state (the newest one always does)
+- 750                  # the branch point of the baseline and the Swift run
+resume_from: null      # a checkpoint folder: start from its weights, AdamW state and step count
+distribution_loss: ode
+trainer: ode
+gradient_checkpointing: true
+num_frame_per_block: 3
+load_raw_video: false
+model_kwargs:
+  timestep_shift: 5.0
+# Swift: the regression target is y + swift_alpha * (y - G_weak(x_t, t)).
+# G_weak is a frozen early checkpoint of this student. 0 gives the baseline.
+swift_alpha: 0.0
+weak_generator_ckpt: null   # a model.pt file; required when swift_alpha is not 0

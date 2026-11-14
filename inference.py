@@ -10,14 +10,11 @@ import torch.distributed as dist
 from torch.utils.data import DataLoader, SequentialSampler
 from torch.utils.data.distributed import DistributedSampler
 
-from pipeline import (
-    CausalDiffusionInferencePipeline,
-    CausalInferencePipeline,
-)
+from networks.sampler import CausalInferencePipeline
 from utils.dataset import TextDataset, TextImagePairDataset
 from utils.misc import set_seed
 
-from demo_utils.memory import gpu, get_cuda_free_memory_gb, DynamicSwapInstaller
+from utils.memory import gpu, get_cuda_free_memory_gb, DynamicSwapInstaller
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--config_path", type=str, help="Path to the config file")
@@ -58,13 +55,8 @@ config = OmegaConf.load(args.config_path)
 default_config = OmegaConf.load("configs/default_config.yaml")
 config = OmegaConf.merge(default_config, config)
 
-# Initialize pipeline
-if hasattr(config, 'denoising_step_list'):
-    # Few-step inference
-    pipeline = CausalInferencePipeline(config, device=device)
-else:
-    # Multi-step diffusion inference
-    pipeline = CausalDiffusionInferencePipeline(config, device=device)
+# Initialize the few-step causal pipeline
+pipeline = CausalInferencePipeline(config, device=device)
 
 if args.checkpoint_path:
     state_dict = torch.load(args.checkpoint_path, map_location="cpu")

@@ -1,5 +1,5 @@
-from utils.wan_wrapper import WanDiffusionWrapper
-from utils.scheduler import SchedulerInterface
+from networks.wrappers import WanDiffusionWrapper
+from networks.scheduler import SchedulerInterface
 from typing import List, Optional
 import torch
 import torch.distributed as dist
