@@ -1,0 +1,106 @@
+%%%%%%%% Paper based on the ICML 2026 submission template %%%%%%%%%%%%%%%%%%%%%%%
+% The unmodified official example is in icml2026_reference/ for reference.
+% Do not edit icml2026.sty: ICML forbids changes to the style template.
+
+\documentclass{article}
+
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{subcaption}
+\usepackage{booktabs}
+\usepackage{hyperref}
+
+% Make hyperref and algorithmic work together.
+\newcommand{\theHalgorithm}{\arabic{algorithm}}
+
+% ---------------------------------------------------------------------------
+% Submission mode. Pick exactly one line.
+%   blind review (default):   \usepackage{icml2026}
+%   arXiv preprint:           \usepackage[preprint]{icml2026}
+%   camera-ready:             \usepackage[accepted]{icml2026}
+% ---------------------------------------------------------------------------
+\usepackage{icml2026}
+
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{mathtools}
+\usepackage{amsthm}
+\usepackage[capitalize,noabbrev]{cleveref}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+
+\theoremstyle{plain}
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{corollary}[theorem]{Corollary}
+\theoremstyle{definition}
+\newtheorem{definition}[theorem]{Definition}
+\newtheorem{assumption}[theorem]{Assumption}
+\theoremstyle{remark}
+\newtheorem{remark}[theorem]{Remark}
+
+% To-do notes. Remove or set [disable] before submission.
+\usepackage[textsize=tiny]{todonotes}
+
+\input{macros}
+
+% Short title for the running head.
+\icmltitlerunning{TODO: Short Running Title}
+
+\begin{document}
+
+\twocolumn[
+  \icmltitle{TODO: Paper Title}
+
+  % Author information is hidden automatically in blind-review mode.
+  \icmlsetsymbol{equal}{*}
+
+  \begin{icmlauthorlist}
+    \icmlauthor{Firstname Lastname}{inst1}
+    \icmlauthor{Firstname Lastname}{inst2}
+  \end{icmlauthorlist}
+
+  \icmlaffiliation{inst1}{Department, University, City, Country}
+  \icmlaffiliation{inst2}{Company, City, Country}
+
+  \icmlcorrespondingauthor{Firstname Lastname}{email@example.edu}
+
+  \icmlkeywords{Video Generation, Diffusion Distillation, Autoregressive Models, ICML}
+
+  \vskip 0.3in
+]
+
+% Required even if empty. Use \printAffiliationsAndNotice{\icmlEqualContribution}
+% when you mark equal contribution.
+\printAffiliationsAndNotice{}
+
+\begin{abstract}
+  \input{sections/abstract}
+\end{abstract}
+
+\input{sections/introduction}
+\input{sections/related_work}
+\input{sections/method}
+\input{sections/experiments}
+\input{sections/conclusion}
+
+% Unnumbered end sections. They do not count toward the 8-page limit.
+% Acknowledgements must NOT appear in the blind-review version.
+% \section*{Acknowledgements}
+
+\section*{Impact Statement}
+\input{sections/impact}
+
+\bibliography{references}
+\bibliographystyle{icml2026}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% APPENDIX (submitted in the same PDF as the main paper)
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\newpage
+\appendix
+\onecolumn
+\input{sections/appendix}
+
+\end{document}

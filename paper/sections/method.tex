@@ -1,0 +1,30 @@
+\section{Method}
+\label{sec:method}
+
+\subsection{Preliminaries: ODE Initialization in Self Forcing}
+\label{sec:method:ode}
+
+Let $\Gphi$ be the few-step autoregressive student. For frame $i$, the student
+takes the noisy frame $\xt$, the clean context frames $\xctx$, and the
+timestep $t$. The target $y$ is the clean frame from the teacher ODE
+trajectory. The standard ODE initialization loss is
+\begin{equation}
+  \LODE = \E \big\| \Gphi(\xt, \xctx, t) - y \big\|^2 .
+  \label{eq:ode}
+\end{equation}
+
+\subsection{Swift ODE Initialization}
+\label{sec:method:swift}
+
+Let $\Gweak$ be a weak model. We use an early checkpoint of the few-step
+student. We move the regression target away from the prediction of the weak
+model:
+\begin{equation}
+  \LSwift = \E \Big\| \Gphi(\xt, \xctx, t)
+    - \Big[ y + \alpha \big( y - \Gweak(\xt, \xctx, t) \big) \Big] \Big\|^2 ,
+  \label{eq:swift}
+\end{equation}
+where $\alpha \ge 0$ controls the strength of the correction. When
+$\alpha = 0$, \cref{eq:swift} is equal to \cref{eq:ode}.
+
+TODO: Explain the intuition and how the weak checkpoint is selected.
