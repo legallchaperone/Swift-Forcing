@@ -22,7 +22,8 @@ cd "${REPO:-$SLURM_SUBMIT_DIR}"
 source slurm/env.sh
 ALPHA=${ALPHA:-0.25}
 ARGS=(--disable-wandb --no_visualize)
-ODE_SAVE=(log_iters=500 "save_steps=[250]" "keep_optimizer_steps=[250]")
+# seed=42 for every run of both arms (ODE and DMD), so that both arms see the same data and noise.
+ODE_SAVE=(log_iters=500 "save_steps=[250]" "keep_optimizer_steps=[250]" seed=42)
 ODE_CONFIG=configs/self_forcing_ode.yaml
 branch=$LOGROOT/ode_shared/checkpoint_model_000250
 ode_final=$LOGROOT/ode_$ARM/checkpoint_model_001000
@@ -56,7 +57,7 @@ case "$ARM" in
     if [ ! -e "$branch/optimizer.pt" ]; then
       rm -rf "$LOGROOT/dmd_smoke"
       if run_train --config_path configs/self_forcing_dmd.yaml --logdir "$LOGROOT/dmd_smoke" "${ARGS[@]}" \
-          max_iters=2 seed=1; then
+          max_iters=2 seed=42; then
         echo "########## DMD smoke test passed"
         # Also test the VBench pipeline end to end, on 2 videos and 2 dimensions (a few minutes).
         env CKPT="$LOGROOT/dmd_smoke/checkpoint_model_000002/model.pt" OUT="$LOGROOT/dmd_smoke/vbench" \
@@ -83,11 +84,11 @@ esac
 # Step 2: VBench subset of the ODE result
 evaluate "$ode_final/model.pt" subset
 
-# Step 3: DMD, evaluated every 50 steps. seed=1: the config has seed 0, which draws a new
+# Step 3: DMD, evaluated every 50 steps. seed=42: the config has seed 0, which draws a new
 # seed at every launch; a fixed seed gives both arms the same prompts and noise, also across pieces.
 for steps in ${DMD_STEPS:-50 100 150 200}; do
   run_train --config_path configs/self_forcing_dmd.yaml --logdir "$LOGROOT/dmd_$ARM" "${ARGS[@]}" \
-    generator_ckpt="$ode_final/model.pt" max_iters="$steps" log_iters=50 seed=1
+    generator_ckpt="$ode_final/model.pt" max_iters="$steps" log_iters=50 seed=42
   ckpt=$LOGROOT/dmd_$ARM/checkpoint_model_$(printf %06d "$steps")/model.pt
   if [ "$steps" = "${DMD_FULL_EVAL_AT:-200}" ]; then evaluate "$ckpt" full; else evaluate "$ckpt" subset; fi
 done
