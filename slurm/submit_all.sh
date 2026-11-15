@@ -40,11 +40,12 @@ j1=$(submit "" --job-name=sf-ode-shared-swift --time=48:00:00 \
 # J2: eligible when J1 starts. The step-750 checkpoint exists about 7.5 h after that.
 j2=$(submit "after:$j1" --job-name=sf-ode-baseline --time=34:00:00 \
   --export=ALL,STAGE=baseline,WAIT_HOURS=10 slurm/train_ode.sbatch)
-# J3: eligible 24 h after J1 starts. J1 ends about 36 h after it starts.
-j3=$(submit "after:$j1+1440" --job-name=sf-dmd-swift --time=48:00:00 \
+# J3: eligible 15 h after J1 starts. J1 ends about 36 h after it starts, so with a
+# queue wait of at least 12 h, J3 waits at most about 9 h for its checkpoint.
+j3=$(submit "after:$j1+900" --job-name=sf-dmd-swift --time=48:00:00 \
   --export=ALL,INIT=swift,WAIT_HOURS=14 slurm/train_dmd.sbatch)
-# J4: eligible 20 h after J2 starts. J2 ends about 23-30 h after it starts.
-j4=$(submit "after:$j2+1200" --job-name=sf-dmd-baseline --time=48:00:00 \
-  --export=ALL,INIT=baseline,WAIT_HOURS=12 slurm/train_dmd.sbatch)
+# J4: eligible 10 h after J2 starts. J2 ends about 23-30 h after it starts.
+j4=$(submit "after:$j2+600" --job-name=sf-dmd-baseline --time=48:00:00 \
+  --export=ALL,INIT=baseline,WAIT_HOURS=16 slurm/train_dmd.sbatch)
 
 echo "J1 shared+swift=$j1  J2 baseline=$j2  J3 dmd_swift=$j3  J4 dmd_baseline=$j4"
