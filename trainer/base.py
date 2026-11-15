@@ -42,6 +42,8 @@ class BaseTrainer:
     Config keys:
         max_iters             stop after this many steps (unset: run until killed)
         log_iters             checkpoint interval
+        save_steps            more steps that get a checkpoint (for example [250] with
+                              log_iters 500 saves 250, 500, 1000, 1500, ...)
         total_batch_size      samples per optimizer update (default: batch_size * number of GPUs)
         resume_from           a checkpoint folder of another run. This run starts from its
                               networks, optimizer states and step count.
@@ -72,6 +74,7 @@ class BaseTrainer:
         self.max_iters = config.get("max_iters")
         self.output_path = config.logdir
         self.keep_optimizer_steps = list(config.get("keep_optimizer_steps") or [])
+        self.save_steps = set(config.get("save_steps") or [])
 
         self.resume_dir = self._find_resume_checkpoint()
         self.start_step = checkpoint_step(self.resume_dir) if self.resume_dir else 0
@@ -247,6 +250,7 @@ class BaseTrainer:
             self.after_step()
 
             if (not self.config.no_save) and (
-                    self.step % self.config.log_iters == 0 or self.step == self.max_iters):
+                    self.step % self.config.log_iters == 0 or self.step in self.save_steps
+                    or self.step == self.max_iters):
                 self.save()
                 torch.cuda.empty_cache()
