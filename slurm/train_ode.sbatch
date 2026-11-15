@@ -8,6 +8,7 @@
 #SBATCH --cpus-per-task=64
 #SBATCH --mem=400g
 #SBATCH --time=40:00:00
+#SBATCH --requeue
 #SBATCH --output=logs/slurm/%x-%j.out
 # ODE initialization of Self Forcing, baseline and Swift. Submit from the repo root.
 # Create the log folder first:  mkdir -p logs/slurm
