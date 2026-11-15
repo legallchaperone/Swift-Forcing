@@ -50,13 +50,23 @@ case "$ARM" in
   baseline)
     # While the other node runs the shared ODE part (about 2.5 h), test the DMD stage on
     # this node: 2 steps from the base model, and one checkpoint. It shows early whether
-    # the 14B teacher fits in GPU and host memory. A failure here does not stop the arm.
+    # the 14B teacher fits in GPU and host memory. Then 2 VBench videos test the evaluation.
+    # A failure here does not stop the arm.
     # A restarted job skips the test once the shared checkpoint exists.
     if [ ! -e "$branch/optimizer.pt" ]; then
       rm -rf "$LOGROOT/dmd_smoke"
-      run_train --config_path configs/self_forcing_dmd.yaml --logdir "$LOGROOT/dmd_smoke" "${ARGS[@]}" \
-        max_iters=2 seed=1 && echo "########## DMD smoke test passed" \
-        || echo "########## DMD smoke test FAILED: the DMD steps of both arms will likely fail too"
+      if run_train --config_path configs/self_forcing_dmd.yaml --logdir "$LOGROOT/dmd_smoke" "${ARGS[@]}" \
+          max_iters=2 seed=1; then
+        echo "########## DMD smoke test passed"
+        # Also test the VBench pipeline end to end, on 2 videos and 2 dimensions (a few minutes).
+        env CKPT="$LOGROOT/dmd_smoke/checkpoint_model_000002/model.pt" OUT="$LOGROOT/dmd_smoke/vbench" \
+          WEIGHTS=generator PROMPTS_PER_DIMENSION=1 SAMPLES_PER_PROMPT=1 \
+          DIMENSIONS="subject_consistency dynamic_degree" bash slurm/eval_vbench.sbatch \
+          && echo "########## VBench smoke test passed" \
+          || echo "########## VBench smoke test FAILED: the evaluations will likely fail too"
+      else
+        echo "########## DMD smoke test FAILED: the DMD steps of both arms will likely fail too"
+      fi
       rm -rf "$LOGROOT/dmd_smoke"
     fi
     waited=0
