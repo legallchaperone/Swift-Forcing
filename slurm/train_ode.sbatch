@@ -28,7 +28,8 @@
 #   sbatch --export=ALL,STAGE=swift,OVERRIDES="swift_alpha=0.5",LOGDIR=logs/ode_swift_a0.5 slurm/train_ode.sbatch
 #
 # Optional variables:
-#   LOGDIR     checkpoint folder (default: logs/ode_<stage>)
+#   LOGROOT    folder of all checkpoint folders (default: logs)
+#   LOGDIR     checkpoint folder (default: $LOGROOT/ode_<stage>)
 #   OVERRIDES  space-separated key=value config overrides
 #   ARGS       train.py flags (default: "--disable-wandb --no_visualize")
 #
@@ -42,7 +43,7 @@ set -euo pipefail
 cd "${REPO:-$SLURM_SUBMIT_DIR}"
 source slurm/env.sh
 
-SHARED=${SHARED:-logs/ode_shared}
+SHARED=${SHARED:-$LOGROOT/ode_shared}
 branch=$SHARED/checkpoint_model_000750   # the checkpoint where the baseline and the Swift run start
 config=configs/self_forcing_ode.yaml
 
@@ -57,10 +58,10 @@ case "$STAGE" in
     # The shared run and then the Swift run in one job: one queue wait less on the longest path.
     run_train --config_path "$config" --logdir "$SHARED" ${ARGS:---disable-wandb --no_visualize} max_iters=750
     stage_args=(resume_from=$branch weak_generator_ckpt=$branch/model.pt swift_alpha=0.25)
-    LOGDIR=${LOGDIR:-logs/ode_swift} ;;
+    LOGDIR=${LOGDIR:-$LOGROOT/ode_swift} ;;
   *) echo "unknown STAGE=$STAGE"; exit 1 ;;
 esac
-LOGDIR=${LOGDIR:-logs/ode_$STAGE}
+LOGDIR=${LOGDIR:-$LOGROOT/ode_$STAGE}
 if [ "$STAGE" = baseline ] || [ "$STAGE" = swift ]; then
   [ "$WAIT_HOURS" -gt 0 ] && wait_for "$branch/optimizer.pt" "$WAIT_HOURS"
 fi

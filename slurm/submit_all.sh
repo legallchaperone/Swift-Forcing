@@ -17,11 +17,14 @@
 #   DRY_RUN=1 bash slurm/submit_all.sh    print the sbatch commands only
 #   bash slurm/submit_all.sh
 #
-# Optional: ALPHA (Swift alpha, default 0.25).
+# Optional: ALPHA (Swift alpha, default 0.25), LOGROOT (folder of the checkpoint folders, default logs).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 mkdir -p logs/slurm
 ALPHA=${ALPHA:-0.25}
+export LOGROOT=${LOGROOT:-logs}
+mkdir -p "$LOGROOT"
+echo "checkpoints go to $LOGROOT" >&2
 
 submit() {  # submit <slurm dependency or ""> <sbatch arguments...>
   local dep=$1; shift
