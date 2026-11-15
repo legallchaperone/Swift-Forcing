@@ -42,6 +42,9 @@ done
 
 ODE_STEP=${ODE_STEP:-3000}
 GEN_CKPT=${GEN_CKPT:-logs/ode_$INIT/checkpoint_model_$(printf %06d "$ODE_STEP")/model.pt}
+# WAIT_HOURS > 0: a job that starts before the ODE run is done waits for its last checkpoint.
+# optimizer.pt is written after model.pt, so its presence means that model.pt is complete.
+if [ "${WAIT_HOURS:-0}" -gt 0 ]; then wait_for "$(dirname "$GEN_CKPT")/optimizer.pt" "$WAIT_HOURS"; fi
 [ -f "$GEN_CKPT" ] || { echo "missing $GEN_CKPT"; exit 1; }
 LOGDIR=${LOGDIR:-logs/dmd_$INIT}
 

@@ -1,28 +1,32 @@
 #!/bin/bash
-# Submit the whole experiment at once, as five chained DeltaAI jobs. Run from the repo root.
+# Submit the whole experiment at once, as four DeltaAI jobs. Run from the repo root.
 #
-#   ode_shared (0 -> 750)
-#     +-- ode_baseline (750 -> 3000) --> dmd_baseline (600 steps)
-#     +-- ode_swift    (750 -> 3000) --> dmd_swift    (600 steps)
+#   J1  ode_shared (0 -> 750), then ode_swift (750 -> 3000), in one job   about 36 h
+#   J2  ode_baseline (750 -> 3000)                                         about 23 h
+#   J3  dmd_swift    (600 steps, from J1's step 3000)                      about 24-32 h
+#   J4  dmd_baseline (600 steps, from J2's step 3000)                      about 24-32 h
 #
-# All jobs enter the queue now. A job starts only after the job it needs ends with
-# success (afterok). This removes the delay of a person submitting the next job.
-# It does not shorten the queue wait: Slurm counts a job's age priority only from the
-# time its dependency is met, so each stage still waits in the queue after the one before.
+# The queue wait (12 h to 4 days per 4-GPU job at a low fairshare) costs more time than
+# the training. So the jobs do not wait for each other to END before they enter the queue:
+#   - J1 holds the longest path (shared + Swift), so that path has one queue wait less.
+#   - J2, J3 and J4 use "after:<job>+<minutes>": each one becomes eligible (and starts to
+#     gain queue priority) a fixed time after the job it needs STARTS, before its input
+#     exists. If a job starts too early, it waits for its input checkpoint (WAIT_HOURS)
+#     and costs 4 SU per hour of waiting. With queue waits of 12 h or more, that is rare.
 #
 #   DRY_RUN=1 bash slurm/submit_all.sh    print the sbatch commands only
 #   bash slurm/submit_all.sh
 #
-# Optional: ALPHA (Swift alpha, default 0.25), SKIP_SHARED=1 (logs/ode_shared/checkpoint_model_000750 exists).
+# Optional: ALPHA (Swift alpha, default 0.25).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 mkdir -p logs/slurm
 ALPHA=${ALPHA:-0.25}
 
-submit() {  # submit <dependency job id or ""> <sbatch arguments...>
+submit() {  # submit <slurm dependency or ""> <sbatch arguments...>
   local dep=$1; shift
   local args=(--parsable)
-  [ -n "$dep" ] && args+=(--dependency=afterok:$dep --kill-on-invalid-dep=yes)
+  [ -n "$dep" ] && args+=(--dependency=$dep)
   if [ -n "${DRY_RUN:-}" ]; then
     echo "sbatch ${args[*]} $*" >&2; echo "DRY$RANDOM"
   else
@@ -30,16 +34,17 @@ submit() {  # submit <dependency job id or ""> <sbatch arguments...>
   fi
 }
 
-shared=""
-if [ -z "${SKIP_SHARED:-}" ]; then
-  # 750 steps at about 36 s per step is about 7.5 h. Ask for 10 h: a shorter limit backfills sooner.
-  shared=$(submit "" --job-name=sf-ode-shared --time=10:00:00 --export=ALL,STAGE=shared slurm/train_ode.sbatch)
-fi
-# 2250 steps: about 22.5 h for the baseline; the Swift run adds a forward pass of the weak model.
-baseline=$(submit "$shared" --job-name=sf-ode-baseline --time=32:00:00 --export=ALL,STAGE=baseline slurm/train_ode.sbatch)
-swift=$(submit "$shared" --job-name=sf-ode-swift --time=38:00:00 \
-  --export=ALL,STAGE=swift,OVERRIDES="swift_alpha=$ALPHA" slurm/train_ode.sbatch)
-dmd_baseline=$(submit "$baseline" --job-name=sf-dmd-baseline --export=ALL,INIT=baseline slurm/train_dmd.sbatch)
-dmd_swift=$(submit "$swift" --job-name=sf-dmd-swift --export=ALL,INIT=swift slurm/train_dmd.sbatch)
+# J1: 7.5 h + 28 h of training. Ask for the 48 h maximum, because the step time on this code is not measured yet.
+j1=$(submit "" --job-name=sf-ode-shared-swift --time=48:00:00 \
+  --export=ALL,STAGE=shared_swift,OVERRIDES="swift_alpha=$ALPHA" slurm/train_ode.sbatch)
+# J2: eligible when J1 starts. The step-750 checkpoint exists about 7.5 h after that.
+j2=$(submit "after:$j1" --job-name=sf-ode-baseline --time=34:00:00 \
+  --export=ALL,STAGE=baseline,WAIT_HOURS=10 slurm/train_ode.sbatch)
+# J3: eligible 24 h after J1 starts. J1 ends about 36 h after it starts.
+j3=$(submit "after:$j1+1440" --job-name=sf-dmd-swift --time=48:00:00 \
+  --export=ALL,INIT=swift,WAIT_HOURS=14 slurm/train_dmd.sbatch)
+# J4: eligible 20 h after J2 starts. J2 ends about 23-30 h after it starts.
+j4=$(submit "after:$j2+1200" --job-name=sf-dmd-baseline --time=48:00:00 \
+  --export=ALL,INIT=baseline,WAIT_HOURS=12 slurm/train_dmd.sbatch)
 
-echo "shared=$shared baseline=$baseline swift=$swift dmd_baseline=$dmd_baseline dmd_swift=$dmd_swift"
+echo "J1 shared+swift=$j1  J2 baseline=$j2  J3 dmd_swift=$j3  J4 dmd_baseline=$j4"

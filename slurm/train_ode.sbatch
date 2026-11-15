@@ -19,6 +19,7 @@
 #   STAGE=shared    steps    0 ->  750, plain target      -> logs/ode_shared
 #   STAGE=baseline  steps  750 -> 3000, plain target      -> logs/ode_baseline
 #   STAGE=swift     steps  750 -> 3000, Swift target      -> logs/ode_swift
+#   STAGE=shared_swift  the shared run, then the Swift run, in one job (see slurm/submit_all.sh)
 #                   the weak model is the frozen step-750 checkpoint of the shared run
 #
 #   sbatch --export=ALL,STAGE=shared --time=14:00:00 slurm/train_ode.sbatch
@@ -37,7 +38,7 @@
 # Cost: 4 GPUs = 4 SU per hour. 400 GB of memory and 64 cores add no charge (the free
 # share of a 4-GPU job is 443 GB and 288 cores).
 set -euo pipefail
-: "${STAGE:?set STAGE to shared, baseline or swift}"
+: "${STAGE:?set STAGE to shared, baseline, swift or shared_swift}"
 cd "${REPO:-$SLURM_SUBMIT_DIR}"
 source slurm/env.sh
 
@@ -45,13 +46,24 @@ SHARED=${SHARED:-logs/ode_shared}
 branch=$SHARED/checkpoint_model_000750   # the checkpoint where the baseline and the Swift run start
 config=configs/self_forcing_ode.yaml
 
+# WAIT_HOURS > 0: a branch job that starts before the step-750 checkpoint exists waits for it.
+WAIT_HOURS=${WAIT_HOURS:-0}
+
 case "$STAGE" in
   shared)   stage_args=(max_iters=750) ;;
   baseline) stage_args=(resume_from=$branch) ;;
   swift)    stage_args=(resume_from=$branch weak_generator_ckpt=$branch/model.pt swift_alpha=0.25) ;;
+  shared_swift)
+    # The shared run and then the Swift run in one job: one queue wait less on the longest path.
+    run_train --config_path "$config" --logdir "$SHARED" ${ARGS:---disable-wandb --no_visualize} max_iters=750
+    stage_args=(resume_from=$branch weak_generator_ckpt=$branch/model.pt swift_alpha=0.25)
+    LOGDIR=${LOGDIR:-logs/ode_swift} ;;
   *) echo "unknown STAGE=$STAGE"; exit 1 ;;
 esac
 LOGDIR=${LOGDIR:-logs/ode_$STAGE}
+if [ "$STAGE" = baseline ] || [ "$STAGE" = swift ]; then
+  [ "$WAIT_HOURS" -gt 0 ] && wait_for "$branch/optimizer.pt" "$WAIT_HOURS"
+fi
 
 # Later key=value arguments override earlier ones.
 run_train --config_path "$config" --logdir "$LOGDIR" ${ARGS:---disable-wandb --no_visualize} \

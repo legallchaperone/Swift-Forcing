@@ -16,3 +16,14 @@ run_train() {  # run_train <train.py arguments...>
   echo "########## train.py $*"
   in_container python -m torch.distributed.run --nproc_per_node="$NGPU" train.py "$@"
 }
+
+wait_for() {  # wait_for <file> <max hours>: block until <file> exists, so a job may start before its input is ready
+  local file=$1 max_s=$(( ${2:-12} * 3600 )) waited=0
+  until [ -e "$file" ]; do
+    if [ "$waited" -ge "$max_s" ]; then echo "gave up waiting for $file"; exit 1; fi
+    [ "$waited" -eq 0 ] && echo "########## waiting for $file (at most ${2:-12} h)"
+    sleep 300; waited=$(( waited + 300 ))
+  done
+  [ "$waited" -gt 0 ] && echo "########## $file is ready after $(( waited / 60 )) min"
+  return 0
+}
