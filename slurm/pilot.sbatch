@@ -6,7 +6,8 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-task=64
-#SBATCH --mem=400g
+#SBATCH --mem=0
+#SBATCH --exclusive
 #SBATCH --time=48:00:00
 #SBATCH --requeue
 #SBATCH --output=logs/slurm/%x-%j.out
@@ -20,11 +21,23 @@
 #
 # Each arm writes its own log: logs/slurm/sf-pilot-<job>-<arm>.out
 # A resubmitted job with the same LOGROOT continues both arms where they stopped.
+# --mem=0 --exclusive: all host memory of both nodes. A 4-GPU job pays for the whole node
+# anyway, and the DMD stage loads the 14B teacher in every process.
 set -euo pipefail
 cd "${REPO:-$SLURM_SUBMIT_DIR}"
 source slurm/env.sh
 mkdir -p "$LOGROOT"
+
+# Stop at once, before any GPU hour, if an input is missing.
+missing=0
+for path in wan_models/Wan2.1-T2V-1.3B wan_models/Wan2.1-T2V-14B data/ode_pairs_16k_shift5 \
+    prompts/vidprom_filtered_extended.txt slurm/eval_vbench.sbatch evaluation/generate.py \
+    evaluation/score.py "$VBENCH_ROOT/VBench" "$SIF"; do
+  [ -e "$path" ] || { echo "missing $path"; missing=1; }
+done
+[ "$missing" = 0 ] || exit 1
 export LOGROOT REPO=$PWD
+df -h "$LOGROOT" "$PWD" | sed "s/^/disk: /"
 
 nodes=($(scontrol show hostnames "$SLURM_JOB_NODELIST"))
 pids=()
