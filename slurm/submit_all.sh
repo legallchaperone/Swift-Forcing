@@ -6,8 +6,9 @@
 #     +-- ode_swift    (750 -> 3000) --> dmd_swift    (600 steps)
 #
 # All jobs enter the queue now. A job starts only after the job it needs ends with
-# success (afterok). With a low fairshare, the queue wait is long, so the jobs collect
-# queue age while they wait, and no step waits for a person to submit the next job.
+# success (afterok). This removes the delay of a person submitting the next job.
+# It does not shorten the queue wait: Slurm counts a job's age priority only from the
+# time its dependency is met, so each stage still waits in the queue after the one before.
 #
 #   DRY_RUN=1 bash slurm/submit_all.sh    print the sbatch commands only
 #   bash slurm/submit_all.sh
