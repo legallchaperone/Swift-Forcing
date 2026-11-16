@@ -576,7 +576,7 @@ def simulate(snap, pool, rate, extra_jobs=(), dt_h=0.25, horizon_h=14 * 24, fs_e
     return result, (tr if trace else None)
 
 
-def predict(snap, cfg, calibrator=None, extra_jobs=(), log_all=False, static=False):
+def predict(snap, cfg, calibrator=None, extra_jobs=(), log_all=False, static=False, use_blend=False):
     """Start ranges for the user's pending jobs (and hypothetical extra jobs).
 
     calibrator(pred_remaining_h) -> (r10, r50, r90) multipliers or None. When it
@@ -586,6 +586,9 @@ def predict(snap, cfg, calibrator=None, extra_jobs=(), log_all=False, static=Fal
     If log_all, out["all"] holds the typical prediction for every pending job.
     """
     out = {"pools": {}, "jobs": {}, "all": {}}
+    jobinfo = {j["id"]: j for j in list(snap["pending"]) + list(extra_jobs)}
+    targets = [j for j in list(snap["pending"]) + list(extra_jobs) if j.get("mine") or j.get("hypothetical")]
+    blend_hist = hist_quantiles(snap, targets) if use_blend else None
     now = snap["now"]
     wanted = {j["pool"] for j in snap["pending"] if j["mine"]} | {j["pool"] for j in extra_jobs}
     if log_all:
@@ -624,16 +627,72 @@ def predict(snap, cfg, calibrator=None, extra_jobs=(), log_all=False, static=Fal
                 if v.get("slow") is not None and v["slow"] < ty:
                     v["slow"] = ty
             adj = dict(v)
-            mult = calibrator((ty - now) / 3600.0) if (calibrator and ty is not None) else None
+            jj = jobinfo.get(jid)
+            mult = calibrator((ty - now) / 3600.0, jj and jj["limit_s"], jj and jj["eq"]) \
+                if (calibrator and ty is not None) else None
             if mult:
                 rem = max(ty - now, 0.0)
                 adj = {"fast": now + rem * mult[0], "typical": now + rem * mult[1], "slow": now + rem * mult[2]}
+            method = "rule+cal" if mult else "rule"
+            if blend_hist is not None and jid in blend_hist:
+                adj_t = blend_quantiles((adj["fast"], adj["typical"], adj["slow"]), blend_hist[jid], now)
+                adj = {"fast": adj_t[0], "typical": adj_t[1], "slow": adj_t[2]}
+                method = "blend"
             out["jobs"][jid] = {
-                "pool": pool, "start": adj, "raw": v, "calibrated": bool(mult),
+                "pool": pool, "start": adj, "raw": v, "calibrated": bool(mult), "method": method,
                 "trace": {"t": trace["t"], "mine": trace["mine"].get(jid), "ahead": trace["ahead"].get(jid),
                           "cut": trace["cut"]} if trace else None,
             }
     return out
+
+
+def size_class(eq):
+    return 1 if eq <= 1 else 2 if eq <= 3 else 4 if eq <= 4 else 8
+
+
+def hist_quantiles(snap, jobs, window_d=3.0):
+    """Baseline: start-time quantiles from similar jobs (same pool and GPU size)
+    that became eligible in the last `window_d` days, given how long this job has
+    already waited. Jobs still pending count as censored (Kaplan-Meier)."""
+    from qmon.calib import km_quantiles
+    T = snap["now"]
+    cache = {}
+    out = {}
+    for j in jobs:
+        key = (j["pool"], size_class(j["eq"]))
+        if key not in cache:
+            obs = []
+            for h in snap["history"]:
+                if h["pool"] == key[0] and size_class(h["eq"]) == key[1] and h.get("elig") \
+                        and T - window_d * 86400 <= h["elig"] < T and h["start"] <= T:
+                    obs.append((h["start"] - h["elig"], 1))
+            for p in snap["pending"]:
+                el = p.get("elig") or p.get("submit")
+                if p["pool"] == key[0] and size_class(p["eq"]) == key[1] and el and T - window_d * 86400 <= el < T \
+                        and p.get("competing", True):
+                    obs.append((T - el, 0))
+            cache[key] = obs
+        el = j.get("elig") or j.get("submit") or T
+        w0 = max(T - el, 0)
+        cond = [(w - w0, e) for (w, e) in cache[key] if w > w0]
+        if sum(e for _, e in cond) < 5:
+            continue
+        q = km_quantiles(cond, (0.1, 0.5, 0.9))
+        if not q or q[1] is None:
+            continue
+        top = max(w for w, _ in cond)
+        q = [x if x is not None else top for x in q]
+        out[j["id"]] = (T + q[0], T + q[1], T + q[2])
+    return out
+
+
+def blend_quantiles(p, q, T):
+    """Average two quantile predictions in log space (hours from T)."""
+    out = []
+    for a, b in zip(p, q):
+        ha, hb = max((a - T) / 3600.0, 0) + 0.5, max((b - T) / 3600.0, 0) + 0.5
+        out.append(T + (math.sqrt(ha * hb) - 0.5) * 3600)
+    return tuple(sorted(out))
 
 
 def hypothetical_job(snap, partition, gpus, hours, nodes=1, cpus=None, account=None):

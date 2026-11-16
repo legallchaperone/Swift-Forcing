@@ -284,7 +284,8 @@ function detailHTML(c, j) {
     h += fact("已经等了", dur(c.now - j.submit, true));
     h += fact("Slurm 自己的估计", j.start ? when(j.start, c.now) : "—");
     h += fact("时限", esc(j.limit));
-    h += fact("范围来自", j.calibrated ? "过去真实等待的校准" : "放行快慢的模拟 <small>数据还不够校准</small>");
+    h += fact("算法", j.method === "blend" ? (j.calibrated ? "规则模型 + 校准 + 历史等待" : "规则模型 + 历史等待 <small>校准数据还不够</small>")
+      : j.calibrated ? "规则模型 + 校准" : "规则模型 <small>校准数据还不够</small>");
   } else if (j.state === "RUNNING") {
     h += fact("开始于", when(j.start, c.now));
     h += fact("最晚结束", when(c.now + (j.left_s || 0), c.now));
@@ -468,7 +469,9 @@ function whatif(c) {
     <div class="wiresult" id="wi-out">${w.html}</div></div>`;
 }
 const ALGO = {
-  "rule+cal": ["规则模型 + 校准", "现在在用"],
+  "blend": ["规则模型 + 分组校准 + 历史等待", "两者在对数尺度上平均"],
+  "rule+cal2": ["规则模型 + 分组校准", "现在在用"],
+  "rule+cal": ["规则模型 + 统一校准", "只按等待长短分组"],
   "rule": ["规则模型", "不校准"],
   "rule-static": ["规则模型，优先级不变", "去掉公平份额和等待时间的变化"],
   "hist-median": ["同类任务的历史等待", "同分区、同卡数，过去 7 天"],

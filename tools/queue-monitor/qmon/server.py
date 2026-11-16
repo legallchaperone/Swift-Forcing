@@ -127,6 +127,7 @@ def build_view(cl, snap, preds, report):
             "reason": j["reason"], "prio": j["prio"], "sprio": j["sprio"],
             "pred": p["start"] if p else None, "trace": p["trace"] if p else None,
             "calibrated": p["calibrated"] if p else False,
+            "method": p.get("method") if p else None,
             "log": log,
         })
     hist = sorted(snap["mine_hist"], key=lambda r: r["submit"] or 0, reverse=True)[:40]

@@ -108,24 +108,24 @@ class Store(object):
         """[(bucket, ratio, event, job, pred_rem_h, real_rem_h or None, slurm_err_h or None, t)]"""
         with _LOCK:
             rows = self.db.execute("""
-                SELECT p.job, p.t, p.pred, p.slurm_est, s.start, n.last, n.gone, p.mine
+                SELECT p.job, p.t, p.pred, p.slurm_est, s.start, n.last, n.gone, p.mine, p.limit_s, p.eq
                 FROM preds p
                 LEFT JOIN starts s ON s.cluster=p.cluster AND s.job=p.job
                 LEFT JOIN seen n ON n.cluster=p.cluster AND n.job=p.job
                 WHERE p.cluster=?""", (cluster,)).fetchall()
         out = []
-        for job, t, pred, sest, start, last, gone, mine in rows:
+        for job, t, pred, sest, start, last, gone, mine, lim, eq in rows:
             rem = (pred - t) / 3600.0
             if rem <= 0.25:
                 continue
             if start is not None and start >= t:
                 real = (start - t) / 3600.0
                 serr = abs(sest - start) / 3600.0 if sest else None
-                out.append((bucket_of(rem), real / rem, 1, job, rem, real, serr, t, mine))
+                out.append((bucket_of(rem), real / rem, 1, job, rem, real, serr, t, mine, lim or 0, eq or 1))
             elif start is None:
                 upto = (last if gone else now) or now
                 cens = max(upto - t, 0) / 3600.0
-                out.append((bucket_of(rem), cens / rem, 0, job, rem, None, None, t, mine))
+                out.append((bucket_of(rem), cens / rem, 0, job, rem, None, None, t, mine, lim or 0, eq or 1))
         return out
 
     def calibrator(self, cluster, now):
@@ -134,23 +134,51 @@ class Store(object):
         if key in self._cache:
             return self._cache[key]
         smp = self.samples(cluster, now)
-        table = {}
-        for b in range(len(BUCKETS)):
-            obs = [(s[1], s[2]) for s in smp if s[0] == b]
-            table[b] = km_quantiles(obs, (0.1, 0.5, 0.9)) if sum(e for _, e in obs) >= MIN_EVENTS else None
+        table = fit_cells(smp)
 
-        def fn(rem_h):
-            q = table.get(bucket_of(rem_h))
-            return q if q and None not in q else None
+        def fn(rem_h, limit_s=None, eq=None):
+            return lookup(table, rem_h, limit_s, eq)
 
         report = accuracy(smp)
         report["buckets"] = [{"range_h": list(BUCKETS[b]), "events": sum(1 for s in smp if s[0] == b and s[2]),
                               "censored": sum(1 for s in smp if s[0] == b and not s[2]),
-                              "q": table[b]} for b in range(len(BUCKETS))]
+                              "q": table.get((b,))} for b in range(len(BUCKETS))]
         report["n_jobs_started"] = len({s[3] for s in smp if s[2]})
         report["n_preds"] = len(smp)
         self._cache[key] = (fn, report)
         return fn, report
+
+
+def cells_of(rem_h, limit_s, eq):
+    """Calibration cells, most specific first: predicted-wait bucket x time-limit
+    class x size class, then bucket x time-limit class, then bucket."""
+    b = bucket_of(rem_h)
+    if limit_s is None or eq is None:
+        return [(b,)]
+    lc = 0 if limit_s <= 4 * 3600 else 1 if limit_s <= 24 * 3600 else 2
+    sc = 0 if eq <= 1 else 1 if eq <= 4 else 2
+    return [(b, lc, sc), (b, lc), (b,)]
+
+
+def fit_cells(smp, min_events=MIN_EVENTS):
+    cells = {}
+    for s in smp:
+        for key in cells_of(s[4], s[9], s[10]):
+            cells.setdefault(key, []).append((s[1], s[2]))
+    table = {}
+    for key, o in cells.items():
+        if sum(e for _, e in o) >= min_events:
+            q = km_quantiles(o, (0.1, 0.5, 0.9))
+            if q and None not in q:
+                table[key] = q
+    return table
+
+
+def lookup(table, rem_h, limit_s=None, eq=None):
+    for key in cells_of(rem_h, limit_s, eq):
+        if key in table:
+            return table[key]
+    return None
 
 
 def km_quantiles(obs, qs):
@@ -185,22 +213,19 @@ def accuracy(smp, days=7):
     tmax = max(s[7] for s in smp)
     train = [s for s in smp if not holdout(s[3])]
     test = [s for s in smp if holdout(s[3]) and s[7] >= tmax - days * 86400]
-    table = {}
-    for b in range(len(BUCKETS)):
-        obs = [(s[1], s[2]) for s in train if s[0] == b]
-        table[b] = km_quantiles(obs, (0.1, 0.5, 0.9)) if sum(e for _, e in obs) >= MIN_EVENTS // 2 else None
+    table = fit_cells(train, MIN_EVENTS // 2)
     raw_err, cal_err, slurm_err, hit, decided = [], [], [], 0, 0
-    for b, ratio, ev, job, rem, real, serr, t, mine in test:
-        q = table.get(b)
+    for b, ratio, ev, job, rem, real, serr, t, mine, lim, eq in test:
+        q = lookup(table, rem, lim, eq)
         if ev:
             raw_err.append(abs(real - rem))
             if serr is not None:
                 slurm_err.append(serr)
-            if q and None not in q:
+            if q:
                 cal_err.append(abs(real - rem * q[1]))
                 decided += 1
                 hit += int(rem * q[0] <= real <= rem * q[2])
-        elif q and None not in q and ratio > q[2]:
+        elif q and ratio > q[2]:
             decided += 1        # still waiting and already past the 90% end: a miss
     med = lambda xs: sorted(xs)[len(xs) // 2] if xs else None
     return {

@@ -182,7 +182,7 @@ class _TreeAt(object):
 # ------------------------------------------------------------------ candidates
 
 def cand_rule(snap, cfg, static=False):
-    pr = model.predict(snap, cfg, log_all=True, static=static)
+    pr = model.predict(snap, cfg, log_all=True, static=static, use_blend=False)
     out = {}
     for jid, v in pr["all"].items():
         if v.get("typical") is None:
@@ -194,7 +194,7 @@ def cand_rule(snap, cfg, static=False):
     return out
 
 
-def cand_hist(snap, jobs_by_pool, window_d=7):
+def cand_hist(snap, jobs_by_pool, window_d=3):
     """Baseline: waits of similar jobs (same pool, same GPU size) in the last week,
     conditioned on how long this job has already waited (Kaplan-Meier)."""
     T = snap["now"]
@@ -228,11 +228,64 @@ def cand_hist(snap, jobs_by_pool, window_d=7):
     return out
 
 
+def strata(rem_h, limit_s, eq):
+    """Calibration cell: predicted wait bucket x time-limit class x size class."""
+    lc = 0 if limit_s <= 4 * 3600 else 1 if limit_s <= 24 * 3600 else 2
+    sc = 0 if eq <= 1 else 1 if eq <= 4 else 2
+    return (calib.bucket_of(rem_h), lc, sc)
+
+
+def cal2_from(train, T, min_events=30):
+    """Like cal_from, but per (bucket, limit class, size class) cell, falling back to
+    (bucket, limit class) and then bucket when a cell has too few started jobs."""
+    cells = {}
+    for (t0, rem_h, truth, end, lim, eq) in train:
+        if t0 >= T:
+            continue
+        if truth is not None and truth <= T:
+            o = ((truth - t0) / 3600.0 / rem_h, 1)
+        elif truth is None and end is not None and end <= T:
+            continue
+        else:
+            o = ((T - t0) / 3600.0 / rem_h, 0)
+        b, lc, sc = strata(rem_h, lim, eq)
+        for key in ((b, lc, sc), (b, lc), (b,)):
+            cells.setdefault(key, []).append(o)
+    table = {}
+    for key, o in cells.items():
+        if sum(e for _, e in o) >= min_events:
+            q = calib.km_quantiles(o, QS)
+            if q and None not in q:
+                table[key] = q
+    return table
+
+
+def cal2_lookup(table, rem_h, lim, eq):
+    b, lc, sc = strata(rem_h, lim, eq)
+    for key in ((b, lc, sc), (b, lc), (b,)):
+        if key in table:
+            return table[key]
+    return None
+
+
+def blend(p, q, T):
+    return model.blend_quantiles(p, q, T)
+
+
+def _old_blend(p, q, T):
+    """Average two quantile predictions in log space (hours from T)."""
+    out = []
+    for a, b in zip(p, q):
+        ha, hb = max((a - T) / 3600.0, 0) + 0.5, max((b - T) / 3600.0, 0) + 0.5
+        out.append(T + (math.sqrt(ha * hb) - 0.5) * 3600)
+    return tuple(sorted(out))
+
+
 def cal_from(train, T):
     """KM ratio quantiles per bucket from earlier rule predictions, as known at T."""
     table = {}
     obs = {}
-    for (t0, rem_h, truth, end) in train:
+    for (t0, rem_h, truth, end, _lim, _eq) in train:
         if t0 >= T:
             continue
         if truth is not None and truth <= T:
@@ -303,7 +356,7 @@ def run(cfg_cluster, data_dir, snap_now, days=21, step_h=6, lookback_d=5, guard_
     log("%s: %d jobs, %d test points" % (name, len(jobs), len(points)))
 
     rnd = random.Random(0)
-    algos = ["rule", "rule+cal", "rule-static", "hist-median"]
+    algos = ["rule", "rule+cal", "rule+cal2", "blend", "rule-static", "hist-median"]  # rule+cal2 is what the app uses
     rows = {a: [] for a in algos}
     rows_b = {}
     unresolved = total = 0
@@ -317,6 +370,7 @@ def run(cfg_cluster, data_dir, snap_now, days=21, step_h=6, lookback_d=5, guard_
         static = cand_rule(snap, cfg_cluster, static=True)
         hist = cand_hist(snap, jobs_by_pool)
         table = cal_from(train, T)
+        table2 = cal2_from(train, T)
         pend = snap["pending"]
         if len(pend) > max_jobs_per_point:
             pend = rnd.sample(pend, max_jobs_per_point)
@@ -335,12 +389,16 @@ def run(cfg_cluster, data_dir, snap_now, days=21, step_h=6, lookback_d=5, guard_
                 rem = (p[1] - T) / 3600.0
                 q = table.get(calib.bucket_of(rem)) if rem > 0.25 else None
                 preds["rule+cal"] = (T + rem * q[0] * 3600, T + rem * q[1] * 3600, T + rem * q[2] * 3600) if q else p
+                q2 = cal2_lookup(table2, rem, j["limit_s"], j["eq"]) if rem > 0.25 else None
+                preds["rule+cal2"] = (T + rem * q2[0] * 3600, T + rem * q2[1] * 3600, T + rem * q2[2] * 3600) if q2 else preds["rule+cal"]
                 if rem > 0.25:
-                    train.append((T, rem, truth, j["_end"]))
+                    train.append((T, rem, truth, j["_end"], j["limit_s"], j["eq"]))
             if j["id"] in static:
                 preds["rule-static"] = static[j["id"]]
             if j["id"] in hist:
                 preds["hist-median"] = hist[j["id"]]
+                if "rule+cal2" in preds:
+                    preds["blend"] = blend(preds["rule+cal2"], hist[j["id"]], T)
             if len(preds) < len(algos):
                 continue                 # compare all algorithms on the same jobs
             for a, p in preds.items():
