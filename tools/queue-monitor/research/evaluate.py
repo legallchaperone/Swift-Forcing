@@ -144,7 +144,22 @@ def two_stage(tr, dur, ev, te, nbins=12, rounds=200, min_events=40):
     return km_apply(te2, table, levels, te.rule_ty.values)
 
 
-def run(df, folds, fold_days, models, train_sel=True, train_days=None):
+def widen(P, f):
+    """Stretch the 10% and 90% points away from the median by factor f, in log(hours + 1) space."""
+    if f == 1:
+        return P
+    L = np.log1p(np.maximum(P, 0))
+    L[:, 0] = L[:, 1] - f * (L[:, 1] - L[:, 0])
+    L[:, 2] = L[:, 1] + f * (L[:, 2] - L[:, 1])
+    return np.expm1(np.maximum(L, 0))
+
+
+def mix(Pa, Pb):
+    """Average two quantile predictions in log(hours + 1) space."""
+    return np.expm1((np.log1p(np.maximum(Pa, 0)) + np.log1p(np.maximum(Pb, 0))) / 2)
+
+
+def run(df, folds, fold_days, models, train_sel=True, train_days=None, widen_f=(1.0,)):
     t_end = df["T"].max()
     out = {m: ([], [], []) for m in models}
     for k in folds:
@@ -168,12 +183,16 @@ def run(df, folds, fold_days, models, train_sel=True, train_days=None):
                 P = km_apply(te, tab, LEVELS[name], te.rule_ty.values)
             elif name == "two":
                 P = two_stage(tr, dur, ev, te)
+            elif name == "mix":
+                tab = km_table(tr, LEVELS["calws"], dur / tr.rule_ty.values, ev, 30)
+                P = mix(two_stage(tr, dur, ev, te), km_apply(te, tab, LEVELS["calws"], te.rule_ty.values))
             out[name][0].append(P); out[name][1].append(y); out[name][2].append(w)
         print("  fold %d: train %d rows, test %d rows" % (k, len(tr), len(te)), flush=True)
     res = {}
     for name, (Ps, Ys, Ws) in out.items():
         P, y, w = np.concatenate(Ps), np.concatenate(Ys), np.concatenate(Ws)
-        print(line(name, P, y, w), flush=True)
+        for f in widen_f:
+            print(line(name if f == 1 else "%s x%.2g" % (name, f), widen(P, f), y, w), flush=True)
         res[name] = (P, y, w)
     return res
 
@@ -185,7 +204,9 @@ if __name__ == "__main__":
     ap.add_argument("--fold-days", type=float, default=7)
     ap.add_argument("--models", default="rule,cal2,calfs,calws,two")
     ap.add_argument("--train-days", type=float, default=None)
+    ap.add_argument("--widen", default="1", help="comma list of interval stretch factors to report")
     a = ap.parse_args()
     fetched, df = load(a.path)
     print("rows %d, points %d, span %.1f days" % (len(df), df["T"].nunique(), (df["T"].max() - df["T"].min()) / 86400))
-    run(df, [int(x) for x in a.folds.split(",")], a.fold_days, a.models.split(","), train_days=a.train_days)
+    run(df, [int(x) for x in a.folds.split(",")], a.fold_days, a.models.split(","), train_days=a.train_days,
+        widen_f=[float(x) for x in a.widen.split(",")])
