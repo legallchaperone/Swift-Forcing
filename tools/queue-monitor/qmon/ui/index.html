@@ -236,7 +236,13 @@ function summary(c, jobs) {
       <div class="meter"><div style="width:${b ? Math.round(100 * b.balance / b.deposited) : 0}%"></div></div></div>
     <div class="stat"><div class="label">公平份额</div><div class="value num">${fsv != null ? fsv.toFixed(3) : "—"}<small>${fsWord}</small></div></div>
     <div class="stat"><div class="label">集群排队</div><div class="value num">${c.queue.competing.toLocaleString()}<small>个任务</small></div></div>
+    ${accStat(c.accuracy || {})}
   </div>`;
+}
+function accStat(a) {
+  if (a.cal_median_err_h != null) return `<div class="stat"><div class="label">预测误差（中位）</div><div class="value num">${dur(a.cal_median_err_h * 3600, true)}<small>命中 ${a.coverage != null ? Math.round(a.coverage * 100) + "%" : "—"}</small></div></div>`;
+  if (a.raw_median_err_h != null) return `<div class="stat"><div class="label">预测误差（中位）</div><div class="value num">${dur(a.raw_median_err_h * 3600, true)}<small>未校准</small></div></div>`;
+  return `<div class="stat"><div class="label">预测准确率</div><div class="value" style="font-size:15px;padding-top:4px">积累数据中<small>已见 ${(a.n_jobs_started || 0).toLocaleString()} 个任务开始</small></div></div>`;
 }
 
 function jobRow(c, j) {
@@ -277,6 +283,7 @@ function detailHTML(c, j) {
     h += fact("已经等了", dur(c.now - j.submit, true));
     h += fact("Slurm 自己的估计", j.start ? when(j.start, c.now) : "—");
     h += fact("时限", esc(j.limit));
+    h += fact("范围来自", j.calibrated ? "过去真实等待的校准" : "放行快慢的模拟 <small>数据还不够校准</small>");
   } else if (j.state === "RUNNING") {
     h += fact("开始于", when(j.start, c.now));
     h += fact("最晚结束", when(c.now + (j.left_s || 0), c.now));
@@ -468,14 +475,28 @@ function history(c) {
     <tr><th>名字</th><th>分区</th><th>GPU</th><th>结果</th><th>提交</th><th>等了</th><th>跑了</th></tr>${rows}</table></div></details>`;
 }
 function notes(c) {
-  const fs = c.fairshare[0], cal = c.calibration;
+  const fs = c.fairshare[0], a = c.accuracy || {};
   const pools = Object.entries(c.pools).map(([k, p]) => `${esc(k)}：约 ${Math.round(p.busy_now || 0)} 张卡在忙，放行速度在 ${Math.round(p.slow)}–${Math.round(p.fast)} 卡·小时/小时之间`).join("<br>");
   return `<details class="more"><summary>预测是怎么算的</summary><div class="card note">
     每个排队任务的优先级 = 公平份额 × ${c.weights.fs} + 等待时间（${Math.round(c.weights.max_age_s / 86400)} 天内涨满 ${c.weights.age}）+ 分区加分。
     公平份额按 Slurm 的 Fair Tree 规则模拟，使用量每 ${Math.round(c.weights.half_life_s / 3600)} 小时减半。集群按过去 3 天的速度放行，优先级高的先走。
     时间范围的两端对应集群放行快和慢的时候。<br><br>${pools}<br>
     模型算出的公平份额和 Slurm 的平均差 ${c.model_check != null ? c.model_check.toFixed(4) : "—"}。
-    校准系数 ×${cal.factor.toFixed(2)}${cal.n ? `（来自你最近 ${cal.n} 个任务的实际等待）` : "（还没有已开始的任务可用来校准）"}。</div></details>`;
+    <br><br><b>校准</b>：应用每次刷新都会记下全集群排队任务的预测，任务真正开始后就知道预测差了多少。
+    按「预测还要等多久」分组，用真实等待把预测修正成一个区间：真实开始时间有 80% 的机会落在「最早」和「最晚」之间。
+    还没开始的任务也算进去（只知道它至少等了多久）。每组至少要有 ${40} 个已开始的任务才启用校准，之前用集群放行快慢的模拟给范围。
+    ${accTable(a)}</div></details>`;
+}
+function accTable(a) {
+  if (!a.buckets) return "";
+  const f = v => v == null ? "—" : dur(v * 3600, true);
+  const rows = a.buckets.map(b => `<tr><td>${b.range_h[1] > 1e8 ? "3 天以上" : b.range_h[0] + "–" + b.range_h[1] + " 小时"}</td>
+    <td class="num">${b.events}</td><td class="num">${b.censored}</td>
+    <td class="num">${b.q && b.q[1] != null ? "×" + b.q[1].toFixed(2) : "—"}</td>
+    <td>${b.q && b.q[2] != null ? "已启用" : "数据不够"}</td></tr>`).join("");
+  return `<br><table><tr><th>预测还要等</th><th>已开始</th><th>还在等</th><th>实际/预测（中位）</th><th>校准</th></tr>${rows}</table>
+    <br>留出一半任务做检验（最近 7 天，${a.n_eval || 0} 次预测）：模型原始预测中位误差 ${f(a.raw_median_err_h)}，
+    校准后 ${f(a.cal_median_err_h)}，Slurm 自己的估计 ${f(a.slurm_median_err_h)}；区间命中率 ${a.coverage != null ? Math.round(a.coverage * 100) + "%" : "—"}（目标 80%）。`;
 }
 
 $("#refresh").onclick = async () => { await post("/api/refresh", {cluster: CUR}); $("#refresh").classList.add("spin"); setTimeout(load, 500); };

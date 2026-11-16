@@ -199,7 +199,7 @@ def parse_snapshot(sec, cfg):
             continue
         g = gpus_from(tres)
         history.append({
-            "pool": pool_of(part), "user": user, "start": st, "elig": tparse(elig), "eq": gpu_eq(part, g, int(tres_value(tres, "cpu"))),
+            "id": jid, "pool": pool_of(part), "user": user, "start": st, "elig": tparse(elig), "eq": gpu_eq(part, g, int(tres_value(tres, "cpu"))),
             "limit_s": parse_duration(limit), "elapsed_s": parse_duration(elapsed), "state": state,
         })
 
@@ -464,8 +464,14 @@ def billing_per_eq(running, pool, fallback=1000.0):
     return quantile(vals, 0.5) or fallback
 
 
-def simulate(snap, pool, rate, extra_jobs=(), dt_h=0.25, horizon_h=14 * 24, fs_every_h=2.0, trace=False):
-    """Returns {job id: start epoch or None} for the user's pending jobs (and extra jobs)."""
+def simulate(snap, pool, rate, extra_jobs=(), dt_h=0.25, horizon_h=14 * 24, fs_every_h=2.0, trace=False,
+             all_jobs=None):
+    """Returns {job id: start epoch or None} for the user's pending jobs (and extra jobs).
+
+    If all_jobs is a dict, it is filled with {job id: {"start", "rank", "ahead"}}
+    for every competing job in the pool (rank and work ahead at t = 0), and the
+    simulation runs until the queue is empty.
+    """
     W = snap["weights"]
     tree = snap["tree"]
     now = snap["now"]
@@ -510,7 +516,20 @@ def simulate(snap, pool, rate, extra_jobs=(), dt_h=0.25, horizon_h=14 * 24, fs_e
     cap = max(q["work"] for q in queue) + eff_rate * 24
     fs_now = f0
     next_fs = 0.0
-    while t <= horizon_h and targets - {k for k, v in result.items() if v is not None}:
+    if all_jobs is not None:
+        q0 = sorted(queue, key=lambda j: -j["prio"])
+        ahead = 0.0
+        for rank, j in enumerate(q0):
+            if j["id"] not in all_jobs:
+                all_jobs[j["id"]] = {"start": None, "rank": rank, "ahead": round(ahead, 1)}
+            ahead += j["work"]
+
+    def unfinished():
+        if all_jobs is not None:
+            return bool(queue)
+        return bool(targets - {k for k, v in result.items() if v is not None})
+
+    while t <= horizon_h and unfinished():
         if t >= next_fs:
             adds = {}
             for (i, b, t_end, t_start) in streams:
@@ -546,6 +565,8 @@ def simulate(snap, pool, rate, extra_jobs=(), dt_h=0.25, horizon_h=14 * 24, fs_e
                 tr["cut"].append([round(t, 2), round(j["p"], 1)])
             if j["id"] in result and result[j["id"]] is None:
                 result[j["id"]] = now + t * 3600
+            if all_jobs is not None and all_jobs.get(j["id"], {}).get("start") is None and j["id"] in all_jobs:
+                all_jobs[j["id"]]["start"] = now + t * 3600
             i = uidx(j["account"], j["user"])
             if i is not None:
                 streams.append((i, j["eq"] * bpe, t + j["limit_s"] / 3600.0 * user_ratio.get(j["user"], run_ratio), t))
@@ -553,11 +574,20 @@ def simulate(snap, pool, rate, extra_jobs=(), dt_h=0.25, horizon_h=14 * 24, fs_e
     return result, (tr if trace else None)
 
 
-def predict(snap, cfg, calibration=None, extra_jobs=()):
-    """Start ranges for the user's pending jobs (and hypothetical extra jobs)."""
-    out = {"pools": {}, "jobs": {}}
-    cal = calibration or 1.0
+def predict(snap, cfg, calibrator=None, extra_jobs=(), log_all=False):
+    """Start ranges for the user's pending jobs (and hypothetical extra jobs).
+
+    calibrator(pred_remaining_h) -> (r10, r50, r90) multipliers or None. When it
+    returns multipliers, the range is the typical simulation scaled by them
+    (an empirical 10/50/90% interval). Otherwise the range comes from the
+    slow / typical / fast drain-rate simulations.
+    If log_all, out["all"] holds the typical prediction for every pending job.
+    """
+    out = {"pools": {}, "jobs": {}, "all": {}}
+    now = snap["now"]
     wanted = {j["pool"] for j in snap["pending"] if j["mine"]} | {j["pool"] for j in extra_jobs}
+    if log_all:
+        wanted |= set(cfg["pools"])
     for pool in cfg["pools"]:
         busy = sum(x["eq"] for x in snap["running"] if x["pool"] == pool)
         r = pool_rates(snap["history"], pool, snap["now"], busy_now=busy)
@@ -568,7 +598,12 @@ def predict(snap, cfg, calibration=None, extra_jobs=()):
         trace = None
         for scen in ("fast", "typical", "slow"):
             rr = dict(r, rate=r[scen])
-            starts, tr = simulate(snap, pool, rr, extra_jobs=extra_jobs, trace=(scen == "typical"))
+            allj = {} if (log_all and scen == "typical") else None
+            starts, tr = simulate(snap, pool, rr, extra_jobs=extra_jobs, trace=(scen == "typical"), all_jobs=allj)
+            if allj:
+                for jid, v in allj.items():
+                    v["pool"] = pool
+                out["all"].update(allj)
             if tr:
                 trace = tr
             for jid, s in starts.items():
@@ -583,11 +618,13 @@ def predict(snap, cfg, calibration=None, extra_jobs=()):
                     v["fast"] = ty
                 if v.get("slow") is not None and v["slow"] < ty:
                     v["slow"] = ty
-            adj = {}
-            for scen, s in v.items():
-                adj[scen] = None if s is None else snap["now"] + (s - snap["now"]) * cal
+            adj = dict(v)
+            mult = calibrator((ty - now) / 3600.0) if (calibrator and ty is not None) else None
+            if mult:
+                rem = max(ty - now, 0.0)
+                adj = {"fast": now + rem * mult[0], "typical": now + rem * mult[1], "slow": now + rem * mult[2]}
             out["jobs"][jid] = {
-                "pool": pool, "start": adj, "raw": v,
+                "pool": pool, "start": adj, "raw": v, "calibrated": bool(mult),
                 "trace": {"t": trace["t"], "mine": trace["mine"].get(jid), "ahead": trace["ahead"].get(jid),
                           "cut": trace["cut"]} if trace else None,
             }

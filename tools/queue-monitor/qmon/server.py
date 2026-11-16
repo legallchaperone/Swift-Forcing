@@ -15,11 +15,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 
-from qmon import collect, model  # noqa: E402
+from qmon import calib, collect, model  # noqa: E402
 
 DATA_DIR = os.path.expanduser("~/Library/Application Support/QueueMonitor")
 CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
-PRED_LOG = os.path.join(DATA_DIR, "predictions.jsonl")
 
 DEFAULT_CONFIG = {
     "port": 8765,
@@ -58,58 +57,11 @@ def load_config():
 
 
 CONFIG = load_config()
+STORE = calib.Store(os.path.join(DATA_DIR, "history.sqlite"))
 STATE = {}        # cluster name -> dict for the UI
 SNAPS = {}        # cluster name -> parsed snapshot (for what-if)
 LOCK = threading.Lock()
 BUSY = set()
-
-
-# ---------------------------------------------------------------- calibration
-
-def log_predictions(cluster, now, preds):
-    with open(PRED_LOG, "a") as f:
-        for jid, p in preds["jobs"].items():
-            if jid == "what-if":
-                continue
-            raw = p["raw"]
-            f.write(json.dumps({"cluster": cluster, "job": jid, "t": now,
-                                "typical": raw.get("typical"), "fast": raw.get("fast"),
-                                "slow": raw.get("slow")}) + "\n")
-
-
-def calibration(cluster, actual_starts):
-    """Median of actual wait / predicted wait over recent jobs that have started.
-
-    Only predictions made at least 2 h before the real start count. Returns
-    (factor, number of jobs, list of per-job records for the UI).
-    """
-    if not os.path.exists(PRED_LOG):
-        return 1.0, 0, []
-    per = {}
-    with open(PRED_LOG) as f:
-        for line in f:
-            try:
-                r = json.loads(line)
-            except ValueError:
-                continue
-            if r.get("cluster") != cluster or r["job"] not in actual_starts or not r.get("typical"):
-                continue
-            start = actual_starts[r["job"]]
-            if start - r["t"] < 2 * 3600 or r["typical"] <= r["t"]:
-                continue
-            per.setdefault(r["job"], []).append(((start - r["t"]) / (r["typical"] - r["t"]), r))
-    recs = []
-    for jid, items in per.items():
-        ratios = sorted(x[0] for x in items)
-        first = min(items, key=lambda x: x[1]["t"])[1]
-        recs.append({"job": jid, "ratio": ratios[len(ratios) // 2], "n": len(items),
-                     "first_t": first["t"], "first_pred": first["typical"], "actual": actual_starts[jid]})
-    recs.sort(key=lambda r: r["actual"])
-    recent = [r["ratio"] for r in recs[-10:]]
-    if not recent:
-        return 1.0, 0, recs
-    fac = sorted(recent)[len(recent) // 2]
-    return max(0.3, min(3.0, fac)), len(recent), recs[-20:]
 
 
 # ---------------------------------------------------------------- refresh
@@ -129,18 +81,11 @@ def refresh(cl):
             raise RuntimeError("SSH 主连接已断开，需要重新登录（Duo）。")
         sec = collect.fetch(cl["alias"], cl["partitions"])
         snap = model.parse_snapshot(sec, cl)
-        actual = {}
-        for j in snap["mine"]:
-            if j["state"] == "RUNNING" and j["start"]:
-                actual[j["id"]] = j["start"]
-        for j in snap["mine_hist"]:
-            if j["start"]:
-                actual[j["id"]] = j["start"]
-        cal, cal_n, cal_recs = calibration(name, actual)
-        preds = model.predict(snap, cl, calibration=cal)
-        log_predictions(name, snap["now"], preds)
-        SNAPS[name] = (snap, cal)
-        st.update(build_view(cl, snap, preds, cal, cal_n, cal_recs))
+        fn, report = STORE.calibrator(name, snap["now"])
+        preds = model.predict(snap, cl, calibrator=fn, log_all=True)
+        STORE.record(name, snap, preds)
+        SNAPS[name] = snap
+        st.update(build_view(cl, snap, preds, report))
         st["error"] = None
         st["updated"] = time.time()
     except Exception as e:  # keep the last good data on screen
@@ -154,7 +99,7 @@ def refresh(cl):
             BUSY.discard(name)
 
 
-def build_view(cl, snap, preds, cal, cal_n, cal_recs):
+def build_view(cl, snap, preds, report):
     tree = snap["tree"]
     me = snap["me"]
     my_fs = []
@@ -173,6 +118,7 @@ def build_view(cl, snap, preds, cal, cal_n, cal_recs):
             "used_s": j["used_s"], "left_s": j["left_s"], "submit": j["submit"], "start": j["start"],
             "reason": j["reason"], "prio": j["prio"], "sprio": j["sprio"],
             "pred": p["start"] if p else None, "trace": p["trace"] if p else None,
+            "calibrated": p["calibrated"] if p else False,
             "log": log,
         })
     hist = sorted(snap["mine_hist"], key=lambda r: r["submit"] or 0, reverse=True)[:40]
@@ -182,7 +128,7 @@ def build_view(cl, snap, preds, cal, cal_n, cal_recs):
         "model_check": tree.self_check(), "pools": preds["pools"], "jobs": jobs, "history": hist,
         "queue": {"pending": len(snap["pending"]), "competing": len(competing),
                   "running": len(snap["running"])},
-        "calibration": {"factor": cal, "n": cal_n, "records": cal_recs},
+        "accuracy": report,
         "weights": snap["weights"], "whatif_partitions": cl.get("whatif_partitions", []),
     }
 
@@ -190,13 +136,14 @@ def build_view(cl, snap, preds, cal, cal_n, cal_recs):
 def whatif(name, partition, gpus, hours):
     if name not in SNAPS:
         return {"error": "还没有这台集群的数据，请先刷新。"}
-    snap, cal = SNAPS[name]
+    snap = SNAPS[name]
     cl = next(c for c in CONFIG["clusters"] if c["name"] == name)
     nodes = max(1, -(-gpus // 4)) if gpus > 4 else 1
     job = model.hypothetical_job(snap, partition, gpus, hours, nodes=nodes)
     if job["pool"] not in cl["pools"]:
         return {"error": "这个分区不在预测范围内：%s" % partition}
-    preds = model.predict(snap, cl, calibration=cal, extra_jobs=[job])
+    fn, _ = STORE.calibrator(name, snap["now"])
+    preds = model.predict(snap, cl, calibrator=fn, extra_jobs=[job])
     p = preds["jobs"].get("what-if")
     return {"partition": partition, "gpus": gpus, "hours": hours, "now": snap["now"],
             "start": p["start"] if p else None, "prio": job["prio"]}
