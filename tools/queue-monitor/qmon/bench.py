@@ -417,6 +417,11 @@ def run(cfg_cluster, data_dir, snap_now, days=21, step_h=6, lookback_d=5, guard_
         "notes": "Slurm's own estimate is not in sacct, so it is only compared on archived live snapshots.",
     }
     res["live"] = run_live(cfg_cluster, data_dir, jobs, fetched_at, guard_d)
+    # Calibration table fitted on the whole backtest: the live app uses it for any
+    # cell that its own log does not cover yet.
+    full = cal2_from(train, fetched_at)
+    with open(os.path.join(bdir, "%s_cal.json" % name), "w") as f:
+        json.dump({"generated": time.time(), "cells": [[list(k), list(v)] for k, v in full.items()]}, f)
     with open(os.path.join(bdir, "%s_results.json" % name), "w") as f:
         json.dump(res, f)
     return res

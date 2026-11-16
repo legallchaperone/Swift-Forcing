@@ -12,6 +12,7 @@ distribution is a Kaplan-Meier estimate, per bucket of predicted remaining wait.
 The 10/50/90% quantiles of that distribution turn one prediction into a
 calibrated range. Accuracy is measured on held-out jobs (half of the job ids).
 """
+import json
 import math
 import os
 import sqlite3
@@ -104,6 +105,15 @@ class Store(object):
         self._cache.pop(cluster, None)
 
     # ------------------------------------------------------------ reading
+    def backtest_cells(self, cluster):
+        p = os.path.join(os.path.dirname(self.path), "bench", "%s_cal.json" % cluster)
+        try:
+            with open(p) as f:
+                d = json.load(f)
+            return {tuple(k): tuple(v) for k, v in d["cells"]}
+        except (IOError, OSError, ValueError, KeyError):
+            return {}
+
     def samples(self, cluster, now):
         """[(bucket, ratio, event, job, pred_rem_h, real_rem_h or None, slurm_err_h or None, t)]"""
         with _LOCK:
@@ -134,7 +144,8 @@ class Store(object):
         if key in self._cache:
             return self._cache[key]
         smp = self.samples(cluster, now)
-        table = fit_cells(smp)
+        table = dict(self.backtest_cells(cluster))
+        table.update(fit_cells(smp))          # live cells win where they exist
 
         def fn(rem_h, limit_s=None, eq=None):
             return lookup(table, rem_h, limit_s, eq)
