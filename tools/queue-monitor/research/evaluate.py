@@ -119,14 +119,14 @@ FEATS = ["rule_fa", "rule_ty", "rule_sl", "rank", "ahead", "hist10", "hist50", "
          "is_array", "u_st6", "u_st24", "a_ahead", "a_pend", "a_st6", "a_st24", "lh10", "lh50", "lh90", "u_eta", "a_eta"]
 
 
-def two_stage(tr, dur, ev, te, nbins=12, rounds=200, min_events=40):
+def two_stage(tr, dur, ev, te, nbins=12, rounds=200, min_events=40, raw=False):
     """A boosted model ranks jobs by log(real / rule wait); Kaplan-Meier per (score bin, rule bucket)."""
     from sklearn.ensemble import HistGradientBoostingRegressor as HGB
 
     def mk():
         return HGB(loss="absolute_error", learning_rate=0.05, max_iter=rounds, max_leaf_nodes=15,
                    min_samples_leaf=1000, l2_regularization=10.0, random_state=0)
-    rule = tr.rule_ty.values
+    rule = np.ones(len(tr)) if raw else tr.rule_ty.values
     lr = np.log((dur + 0.5) / (rule + 0.5))
     fit_m = (ev == 1) | (dur > 24)
     X = tr[FEATS].values.astype(float)
@@ -138,10 +138,10 @@ def two_stage(tr, dur, ev, te, nbins=12, rounds=200, min_events=40):
     m = mk().fit(X[fit_m], lr[fit_m])
     edges = np.quantile(oof, np.linspace(0, 1, nbins + 1)[1:-1])
     keys = pd.DataFrame({"b": tr.b.values, "s": np.searchsorted(edges, oof)})
-    levels = [("b", "s"), ("s",)]
+    levels = [("s",)] if raw else [("b", "s"), ("s",)]
     table = km_table(keys, levels, dur / rule, ev, min_events)
     te2 = te.assign(s=np.searchsorted(edges, m.predict(te[FEATS].values.astype(float))))
-    return km_apply(te2, table, levels, te.rule_ty.values)
+    return km_apply(te2, table, levels, np.ones(len(te)) if raw else te.rule_ty.values)
 
 
 def widen(P, f):
@@ -183,6 +183,10 @@ def run(df, folds, fold_days, models, train_sel=True, train_days=None, widen_f=(
                 P = km_apply(te, tab, LEVELS[name], te.rule_ty.values)
             elif name == "two":
                 P = two_stage(tr, dur, ev, te)
+            elif name == "two20":
+                P = two_stage(tr, dur, ev, te, nbins=20)
+            elif name == "twod":
+                P = two_stage(tr, dur, ev, te, nbins=20, raw=True)
             elif name == "mix":
                 tab = km_table(tr, LEVELS["calws"], dur / tr.rule_ty.values, ev, 30)
                 P = mix(two_stage(tr, dur, ev, te), km_apply(te, tab, LEVELS["calws"], te.rule_ty.values))

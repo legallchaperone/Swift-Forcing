@@ -65,10 +65,47 @@ JBP = None
 FETCHED = None
 
 
+CONC = None   # {("a", account) or ("u", user): (grid t0, hourly running GPU-eq array)}
+
+
+def concurrency(jobs, step=3600.0):
+    """Running GPU-equivalents per account and per user on an hourly grid."""
+    t0 = min(j["start"] for j in jobs if j["start"])
+    t1 = max((j["end"] or j["start"]) for j in jobs if j["start"])
+    n = int((t1 - t0) / step) + 2
+    out = {}
+    for j in jobs:
+        if not j["start"]:
+            continue
+        a = int((j["start"] - t0) / step) + 1
+        b = int(((j["end"] or t1) - t0) / step) + 1
+        for key in (("a", j["account"]), ("u", j["user"])):
+            arr = out.get(key)
+            if arr is None:
+                arr = out[key] = [0.0] * n
+            for i in range(a, min(b, n)):
+                arr[i] += j["eq"]
+    return t0, step, out
+
+
+def conc_feats(key, T):
+    t0, step, out = CONC
+    arr = out.get(key)
+    if arr is None:
+        return 0.0, 0.0
+    i = int((T - t0) / step)
+    lo = max(0, i - int(7 * 86400 / step))
+    if i < 0 or lo >= len(arr):
+        return 0.0, 0.0
+    now = arr[min(i, len(arr) - 1)]
+    return now, max(arr[lo:i + 1] or [0.0])
+
+
 def init():
-    global SNAP0, JOBS, JBP, FETCHED
+    global SNAP0, JOBS, JBP, FETCHED, CONC
     SNAP0 = SNAP0 or base_snap()
     FETCHED, JOBS = bench.load_history(HPATH, cfg)
+    CONC = concurrency(JOBS)
     JBP = {}
     for j in JOBS:
         JBP.setdefault(j["pool"], []).append(j)
@@ -171,6 +208,8 @@ def feats_at(T):
         lq = lim_cache[lkey]
         rows.append({
             "u_st6": ust6.get(k, 0), "u_st24": ust24.get(k, 0),
+            "acct_now": conc_feats(("a", j["account"]), T)[0], "acct_max7": conc_feats(("a", j["account"]), T)[1],
+            "user_now": conc_feats(("u", j["user"]), T)[0], "user_max7": conc_feats(("u", j["user"]), T)[1],
             "a_ahead": a_ahead, "a_pend": len(arr.get(base, [])) if "_" in j["id"] else None,
             "a_st6": ast6.get(base, 0), "a_st24": ast24.get(base, 0),
             "lh10": (lq[0] / 3600.0 if lq and lq[0] is not None else None),
