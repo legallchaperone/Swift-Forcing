@@ -293,6 +293,8 @@ class FairTree(object):
         header = lines[0].split("|")
         try:
             ia, iu, ins, iru, ifs = (header.index(k) for k in ("Account", "User", "NormShares", "RawUsage", "FairShare"))
+            irs = header.index("RawShares")
+            ilf = header.index("LevelFS")
         except ValueError:
             return t
         stack = []
@@ -304,8 +306,10 @@ class FairTree(object):
             depth = len(raw_acct) - len(raw_acct.lstrip(" "))
             node = {
                 "name": raw_acct.strip(), "user": p[iu].strip(), "depth": depth,
-                "shares": float(p[ins] or 0), "raw": float(p[iru] or 0), "children": [],
+                "shares": float(p[ins] or 0), "raw_shares": float(p[irs] or 0) if p[irs].replace(".", "").isdigit() else 1.0,
+                "raw": float(p[iru] or 0), "children": [],
                 "parent": None, "fs_obs": float(p[ifs]) if p[ifs] else None,
+                "lfs_obs": p[ilf].strip(),
             }
             while stack and t.nodes[stack[-1]]["depth"] >= depth:
                 stack.pop()
@@ -318,6 +322,16 @@ class FairTree(object):
                 t.user_index[(node["name"], node["user"])] = idx
             else:
                 stack.append(idx)
+        # RawUsage is printed as an integer, so tiny usage shows as 0 while LevelFS
+        # is finite. Recover it from LevelFS = shares / (usage / parent usage).
+        for nd in t.nodes:  # parents come before children
+            try:
+                lfs = float(nd["lfs_obs"])
+            except ValueError:
+                continue
+            if nd["raw"] == 0 and nd["parent"] is not None and 0 < lfs < INF:
+                pr = t.nodes[nd["parent"]]["raw"]
+                nd["raw"] = nd["shares"] / lfs * pr if pr > 0 else 0.0
         return t
 
     def user_count(self):
@@ -340,28 +354,46 @@ class FairTree(object):
 
         def level_fs(i):
             nd = self.nodes[i]
+            if nd["raw_shares"] <= 0:
+                return 0.0
             par = nd["parent"]
             pu = usage[par] if par is not None else usage[i]
             if usage[i] <= 0 or pu <= 0:
                 return INF
-            return nd["shares"] / (usage[i] / pu)
+            return max(nd["shares"], 1e-12) / (usage[i] / pu)
 
-        def visit(i):
-            kids = sorted(self.nodes[i]["children"], key=level_fs, reverse=True)
-            for k in kids:
-                if self.nodes[k]["user"]:
+        def visit(siblings):
+            # Slurm Fair Tree: siblings sorted by LevelFS; tied siblings share a
+            # rank, and tied accounts have their children merged into one level.
+            lf = {k: level_fs(k) for k in siblings}
+            order = sorted(siblings, key=lambda k: -lf[k] if lf[k] != INF else -1e300)
+            g = 0
+            while g < len(order):
+                h = g
+                while h < len(order) and (lf[order[h]] == lf[order[g]] or
+                                          (lf[order[g]] != INF and abs(lf[order[h]] - lf[order[g]]) <= 1e-12 * abs(lf[order[g]]))):
+                    h += 1
+                group = order[g:h]
+                users = [k for k in group if self.nodes[k]["user"]]
+                accts = [k for k in group if not self.nodes[k]["user"]]
+                for k in users:
                     out[k] = rank[0] / float(total)
-                    rank[0] -= 1
-                else:
-                    visit(k)
+                rank[0] -= len(users)
+                if accts:
+                    kids = []
+                    for a in accts:
+                        kids.extend(self.nodes[a]["children"])
+                    visit(kids)
+                g = h
 
         roots = [i for i, nd in enumerate(self.nodes) if nd["parent"] is None]
+        top = []
         for r in roots:
             if self.nodes[r]["user"]:
-                out[r] = rank[0] / float(total)
-                rank[0] -= 1
+                top.append(r)
             else:
-                visit(r)
+                top.extend(self.nodes[r]["children"])
+        visit(top)
         return out
 
     def self_check(self):
