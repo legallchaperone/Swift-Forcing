@@ -73,6 +73,10 @@ def run(cl, fetch=True, log=print):
         os.replace(study + ".tmp", study)
     else:
         log("study failed: %s" % r.stderr.decode()[-300:])
+    try:
+        os.remove(table)        # about 0.5 GB; rebuilt at the next retraining
+    except OSError:
+        pass
     return out
 
 
