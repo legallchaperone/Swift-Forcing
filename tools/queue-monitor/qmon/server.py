@@ -15,7 +15,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 
-from qmon import calib, collect, model  # noqa: E402
+from qmon import archive, bench, calib, collect, model  # noqa: E402
 
 DATA_DIR = os.path.expanduser("~/Library/Application Support/QueueMonitor")
 CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
@@ -61,6 +61,9 @@ STORE = calib.Store(os.path.join(DATA_DIR, "history.sqlite"))
 STATE = {}        # cluster name -> dict for the UI
 SNAPS = {}        # cluster name -> parsed snapshot (for what-if)
 LOCK = threading.Lock()
+LAST_SEC = {}     # cluster name -> raw sections of the last refresh
+BENCH = {}        # cluster name -> latest backtest results
+BENCH_STATUS = {}
 BUSY = set()
 
 
@@ -85,6 +88,11 @@ def refresh(cl):
         preds = model.predict(snap, cl, calibrator=fn, log_all=True)
         STORE.record(name, snap, preds)
         SNAPS[name] = snap
+        LAST_SEC[name] = sec
+        try:
+            archive.maybe_save(DATA_DIR, name, sec, snap["now"])
+        except Exception:
+            traceback.print_exc()
         st.update(build_view(cl, snap, preds, report))
         st["error"] = None
         st["updated"] = time.time()
@@ -156,6 +164,38 @@ def loop():
         time.sleep(max(60, CONFIG["refresh_minutes"] * 60))
 
 
+def load_bench():
+    for cl in CONFIG["clusters"]:
+        p = os.path.join(DATA_DIR, "bench", "%s_results.json" % cl["name"])
+        if os.path.exists(p):
+            try:
+                with open(p) as f:
+                    BENCH[cl["name"]] = json.load(f)
+            except ValueError:
+                pass
+
+
+def bench_loop():
+    """Re-run the backtest once a day (first run a few minutes after start)."""
+    load_bench()
+    time.sleep(300)
+    while True:
+        for cl in CONFIG["clusters"]:
+            name = cl["name"]
+            last = BENCH.get(name, {}).get("generated", 0)
+            if time.time() - last < 20 * 3600 or name not in LAST_SEC:
+                continue
+            BENCH_STATUS[name] = "running"
+            try:
+                snap = model.parse_snapshot(LAST_SEC[name], cl)   # private copy of the tree
+                BENCH[name] = bench.run(cl, DATA_DIR, snap, log=lambda *a: None)
+                BENCH_STATUS[name] = "ok"
+            except Exception as e:
+                BENCH_STATUS[name] = "error: %s" % e
+                traceback.print_exc()
+        time.sleep(1800)
+
+
 def open_login(alias):
     cmd = "ssh %s true && echo '登录成功，可以关掉这个窗口。'" % alias
     script = 'tell application "Terminal"\nactivate\ndo script "%s"\nend tell' % cmd.replace('"', '\\"')
@@ -189,7 +229,8 @@ class Handler(BaseHTTPRequestHandler):
             with open(os.path.join(HERE, "ui", "index.html"), "rb") as f:
                 return self._send(200, f.read(), "text/html; charset=utf-8")
         if self.path.startswith("/api/state"):
-            return self._send(200, {"clusters": [STATE.get(c["name"], {"name": c["name"], "alias": c["alias"]})
+            return self._send(200, {"clusters": [dict(STATE.get(c["name"], {"name": c["name"], "alias": c["alias"]}),
+                                                      bench=BENCH.get(c["name"]), bench_status=BENCH_STATUS.get(c["name"]))
                                                  for c in CONFIG["clusters"]],
                                     "refresh_minutes": CONFIG["refresh_minutes"], "server_time": time.time()})
         return self._send(404, {"error": "not found"})
@@ -221,6 +262,7 @@ def main():
     port = int(os.environ.get("QMON_PORT", CONFIG["port"]))
     srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     threading.Thread(target=loop, daemon=True).start()
+    threading.Thread(target=bench_loop, daemon=True).start()
     print("Queue Monitor on http://127.0.0.1:%d" % port, flush=True)
     srv.serve_forever()
 

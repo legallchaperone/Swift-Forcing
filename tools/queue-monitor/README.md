@@ -74,6 +74,17 @@ that connection has dropped, the app shows a button that opens Terminal with
   prediction and of Slurm's own estimate, and how often the real start fell inside
   the range (target 80%).
 
+## Benchmark (backtest)
+
+`python3 -m qmon.bench --cluster DeltaAI` (the app also runs it daily) compares
+algorithms on past data: the queue is rebuilt from 3 weeks of `sacct` every
+6 hours, each algorithm predicts from what was known at that moment, and the
+predictions are scored against the real start times (median error, median
+|log ratio|, 10-90% coverage, pinball loss), overall and by wait length. Archived
+live snapshots (`qmon/archive.py`, every 2 h) add Slurm's own estimate to the
+comparison. To add an algorithm, write a function snapshot -> {job: (p10, p50, p90)}
+in `qmon/bench.py` and add it to the loop. The app shows the leaderboard.
+
 Known limits: node fragmentation (a 4-GPU job needs a whole free node) and
 reservations are not modelled; jobs held or waiting on dependencies are ignored
 until they become eligible.

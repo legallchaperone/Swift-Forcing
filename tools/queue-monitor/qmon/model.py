@@ -465,12 +465,14 @@ def billing_per_eq(running, pool, fallback=1000.0):
 
 
 def simulate(snap, pool, rate, extra_jobs=(), dt_h=0.25, horizon_h=14 * 24, fs_every_h=2.0, trace=False,
-             all_jobs=None):
+             all_jobs=None, static=False):
     """Returns {job id: start epoch or None} for the user's pending jobs (and extra jobs).
 
     If all_jobs is a dict, it is filled with {job id: {"start", "rank", "ahead"}}
     for every competing job in the pool (rank and work ahead at t = 0), and the
     simulation runs until the queue is empty.
+    static=True freezes every priority at its current value (an ablation that
+    drops the fair-share and age dynamics).
     """
     W = snap["weights"]
     tree = snap["tree"]
@@ -530,7 +532,7 @@ def simulate(snap, pool, rate, extra_jobs=(), dt_h=0.25, horizon_h=14 * 24, fs_e
         return bool(targets - {k for k, v in result.items() if v is not None})
 
     while t <= horizon_h and unfinished():
-        if t >= next_fs:
+        if t >= next_fs and not static:
             adds = {}
             for (i, b, t_end, t_start) in streams:
                 # usage accrued in [t_start, min(t, t_end)], decayed to time t
@@ -544,7 +546,7 @@ def simulate(snap, pool, rate, extra_jobs=(), dt_h=0.25, horizon_h=14 * 24, fs_e
         for j in queue:
             i = uidx(j["account"], j["user"])
             dfs = (fs_now.get(i, 0.0) - f0.get(i, 0.0)) * W["fs"] if i is not None else 0.0
-            dage = min(j["age0"] + age_rate * t, W["age"]) - j["age0"]
+            dage = 0.0 if static else min(j["age0"] + age_rate * t, W["age"]) - j["age0"]
             j["p"] = j["prio"] + dfs + dage
         queue.sort(key=lambda j: -j["p"])
         if trace and abs(t - round(t)) < 1e-9:
@@ -574,7 +576,7 @@ def simulate(snap, pool, rate, extra_jobs=(), dt_h=0.25, horizon_h=14 * 24, fs_e
     return result, (tr if trace else None)
 
 
-def predict(snap, cfg, calibrator=None, extra_jobs=(), log_all=False):
+def predict(snap, cfg, calibrator=None, extra_jobs=(), log_all=False, static=False):
     """Start ranges for the user's pending jobs (and hypothetical extra jobs).
 
     calibrator(pred_remaining_h) -> (r10, r50, r90) multipliers or None. When it
@@ -598,12 +600,15 @@ def predict(snap, cfg, calibrator=None, extra_jobs=(), log_all=False):
         trace = None
         for scen in ("fast", "typical", "slow"):
             rr = dict(r, rate=r[scen])
-            allj = {} if (log_all and scen == "typical") else None
-            starts, tr = simulate(snap, pool, rr, extra_jobs=extra_jobs, trace=(scen == "typical"), all_jobs=allj)
+            allj = {} if log_all else None
+            starts, tr = simulate(snap, pool, rr, extra_jobs=extra_jobs, trace=(scen == "typical"),
+                                  all_jobs=allj, static=static)
             if allj:
                 for jid, v in allj.items():
-                    v["pool"] = pool
-                out["all"].update(allj)
+                    d = out["all"].setdefault(jid, {"pool": pool, "rank": v["rank"], "ahead": v["ahead"]})
+                    d[scen] = v["start"]
+                    if scen == "typical":
+                        d["start"] = v["start"]
             if tr:
                 trace = tr
             for jid, s in starts.items():
