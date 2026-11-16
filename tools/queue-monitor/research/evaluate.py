@@ -189,6 +189,16 @@ def run(df, folds, fold_days, models, train_sel=True, train_days=None, widen_f=(
                 P = two_stage(tr, dur, ev, te, nbins=20)
             elif name == "twod":
                 P = two_stage(tr, dur, ev, te, nbins=20, raw=True)
+            elif name in ("mixd", "mix3"):
+                tab = km_table(tr, LEVELS["calws"], dur / tr.rule_ty.values, ev, 30)
+                Pk = km_apply(te, tab, LEVELS["calws"], te.rule_ty.values)
+                Pd = two_stage(tr, dur, ev, te, nbins=20, raw=True)
+                if name == "mixd":
+                    P = mix(Pd, Pk)
+                else:
+                    L = (np.log1p(np.maximum(Pd, 0)) + np.log1p(np.maximum(Pk, 0))
+                         + np.log1p(np.maximum(two_stage(tr, dur, ev, te, nbins=20), 0))) / 3
+                    P = np.expm1(L)
             elif name == "mix":
                 tab = km_table(tr, LEVELS["calws"], dur / tr.rule_ty.values, ev, 30)
                 P = mix(two_stage(tr, dur, ev, te), km_apply(te, tab, LEVELS["calws"], te.rule_ty.values))
