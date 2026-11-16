@@ -1,0 +1,282 @@
+"""Queue Monitor: a local web server that the Mac app window shows.
+
+Run:  python3 -m qmon.server   (from tools/queue-monitor)
+Serves http://127.0.0.1:8765 . Python 3.9 standard library only.
+"""
+import json
+import os
+import subprocess
+import sys
+import threading
+import time
+import traceback
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.dirname(HERE))
+
+from qmon import collect, model  # noqa: E402
+
+DATA_DIR = os.path.expanduser("~/Library/Application Support/QueueMonitor")
+CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
+PRED_LOG = os.path.join(DATA_DIR, "predictions.jsonl")
+
+DEFAULT_CONFIG = {
+    "port": 8765,
+    "refresh_minutes": 10,
+    "clusters": [
+        {
+            "name": "DeltaAI", "alias": "deltaai",
+            "pools": ["ghx4"],
+            "partitions": ["ghx4", "ghx4-interactive"],
+            "cpus_per_gpu": {"ghx4": 72, "default": 72},
+            "whatif_partitions": ["ghx4", "ghx4-interactive"],
+        },
+        {
+            "name": "Delta", "alias": "delta",
+            "pools": ["gpuA40x4", "gpuA100x4", "gpuA100x8", "gpuH200x8"],
+            "partitions": ["gpuA40x4", "gpuA40x4-interactive", "gpuA40x4-preempt",
+                           "gpuA100x4", "gpuA100x4-interactive", "gpuA100x4-preempt",
+                           "gpuA100x8", "gpuA100x8-interactive", "gpuH200x8", "gpuH200x8-interactive"],
+            "cpus_per_gpu": {"gpuA40x4": 16, "gpuA100x4": 16, "gpuA100x8": 16, "gpuH200x8": 12, "default": 16},
+            "whatif_partitions": ["gpuA40x4", "gpuA100x4", "gpuH200x8", "gpuA40x4-preempt"],
+        },
+    ],
+}
+
+
+def load_config():
+    os.makedirs(DATA_DIR, exist_ok=True)
+    if not os.path.exists(CONFIG_PATH):
+        with open(CONFIG_PATH, "w") as f:
+            json.dump(DEFAULT_CONFIG, f, indent=2)
+    with open(CONFIG_PATH) as f:
+        cfg = json.load(f)
+    for k, v in DEFAULT_CONFIG.items():
+        cfg.setdefault(k, v)
+    return cfg
+
+
+CONFIG = load_config()
+STATE = {}        # cluster name -> dict for the UI
+SNAPS = {}        # cluster name -> parsed snapshot (for what-if)
+LOCK = threading.Lock()
+BUSY = set()
+
+
+# ---------------------------------------------------------------- calibration
+
+def log_predictions(cluster, now, preds):
+    with open(PRED_LOG, "a") as f:
+        for jid, p in preds["jobs"].items():
+            if jid == "what-if":
+                continue
+            raw = p["raw"]
+            f.write(json.dumps({"cluster": cluster, "job": jid, "t": now,
+                                "typical": raw.get("typical"), "fast": raw.get("fast"),
+                                "slow": raw.get("slow")}) + "\n")
+
+
+def calibration(cluster, actual_starts):
+    """Median of actual wait / predicted wait over recent jobs that have started.
+
+    Only predictions made at least 2 h before the real start count. Returns
+    (factor, number of jobs, list of per-job records for the UI).
+    """
+    if not os.path.exists(PRED_LOG):
+        return 1.0, 0, []
+    per = {}
+    with open(PRED_LOG) as f:
+        for line in f:
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            if r.get("cluster") != cluster or r["job"] not in actual_starts or not r.get("typical"):
+                continue
+            start = actual_starts[r["job"]]
+            if start - r["t"] < 2 * 3600 or r["typical"] <= r["t"]:
+                continue
+            per.setdefault(r["job"], []).append(((start - r["t"]) / (r["typical"] - r["t"]), r))
+    recs = []
+    for jid, items in per.items():
+        ratios = sorted(x[0] for x in items)
+        first = min(items, key=lambda x: x[1]["t"])[1]
+        recs.append({"job": jid, "ratio": ratios[len(ratios) // 2], "n": len(items),
+                     "first_t": first["t"], "first_pred": first["typical"], "actual": actual_starts[jid]})
+    recs.sort(key=lambda r: r["actual"])
+    recent = [r["ratio"] for r in recs[-10:]]
+    if not recent:
+        return 1.0, 0, recs
+    fac = sorted(recent)[len(recent) // 2]
+    return max(0.3, min(3.0, fac)), len(recent), recs[-20:]
+
+
+# ---------------------------------------------------------------- refresh
+
+def refresh(cl):
+    name = cl["name"]
+    with LOCK:
+        if name in BUSY:
+            return
+        BUSY.add(name)
+    st = dict(STATE.get(name, {}), name=name, alias=cl["alias"], refreshing=True)
+    STATE[name] = st
+    try:
+        alive = collect.socket_alive(cl["alias"])
+        st["socket"] = alive
+        if not alive:
+            raise RuntimeError("SSH 主连接已断开，需要重新登录（Duo）。")
+        sec = collect.fetch(cl["alias"], cl["partitions"])
+        snap = model.parse_snapshot(sec, cl)
+        actual = {}
+        for j in snap["mine"]:
+            if j["state"] == "RUNNING" and j["start"]:
+                actual[j["id"]] = j["start"]
+        for j in snap["mine_hist"]:
+            if j["start"]:
+                actual[j["id"]] = j["start"]
+        cal, cal_n, cal_recs = calibration(name, actual)
+        preds = model.predict(snap, cl, calibration=cal)
+        log_predictions(name, snap["now"], preds)
+        SNAPS[name] = (snap, cal)
+        st.update(build_view(cl, snap, preds, cal, cal_n, cal_recs))
+        st["error"] = None
+        st["updated"] = time.time()
+    except Exception as e:  # keep the last good data on screen
+        st["error"] = str(e)
+        traceback.print_exc()
+    finally:
+        st["refreshing"] = False
+        st["last_try"] = time.time()
+        STATE[name] = st
+        with LOCK:
+            BUSY.discard(name)
+
+
+def build_view(cl, snap, preds, cal, cal_n, cal_recs):
+    tree = snap["tree"]
+    me = snap["me"]
+    my_fs = []
+    f0 = tree.factors(1.0, {})
+    for (acct, user), idx in tree.user_index.items():
+        if user == me and acct != "noalloc":
+            my_fs.append({"account": acct, "observed": tree.nodes[idx]["fs_obs"], "model": f0.get(idx),
+                          "users": tree.user_count()})
+    jobs = []
+    for j in snap["mine"]:
+        p = preds["jobs"].get(j["id"])
+        log = snap["logs"].get(j["id"])
+        jobs.append({
+            "id": j["id"], "name": j["name"], "partition": j["partition"], "state": j["state"],
+            "gpus": j["gpus"], "nodes": j["nodes"], "limit": j["limit"], "limit_s": j["limit_s"],
+            "used_s": j["used_s"], "left_s": j["left_s"], "submit": j["submit"], "start": j["start"],
+            "reason": j["reason"], "prio": j["prio"], "sprio": j["sprio"],
+            "pred": p["start"] if p else None, "trace": p["trace"] if p else None,
+            "log": log,
+        })
+    hist = sorted(snap["mine_hist"], key=lambda r: r["submit"] or 0, reverse=True)[:40]
+    competing = [x for x in snap["pending"] if x["competing"]]
+    return {
+        "now": snap["now"], "me": me, "balances": snap["balances"], "fairshare": my_fs,
+        "model_check": tree.self_check(), "pools": preds["pools"], "jobs": jobs, "history": hist,
+        "queue": {"pending": len(snap["pending"]), "competing": len(competing),
+                  "running": len(snap["running"])},
+        "calibration": {"factor": cal, "n": cal_n, "records": cal_recs},
+        "weights": snap["weights"], "whatif_partitions": cl.get("whatif_partitions", []),
+    }
+
+
+def whatif(name, partition, gpus, hours):
+    if name not in SNAPS:
+        return {"error": "还没有这台集群的数据，请先刷新。"}
+    snap, cal = SNAPS[name]
+    cl = next(c for c in CONFIG["clusters"] if c["name"] == name)
+    nodes = max(1, -(-gpus // 4)) if gpus > 4 else 1
+    job = model.hypothetical_job(snap, partition, gpus, hours, nodes=nodes)
+    if job["pool"] not in cl["pools"]:
+        return {"error": "这个分区不在预测范围内：%s" % partition}
+    preds = model.predict(snap, cl, calibration=cal, extra_jobs=[job])
+    p = preds["jobs"].get("what-if")
+    return {"partition": partition, "gpus": gpus, "hours": hours, "now": snap["now"],
+            "start": p["start"] if p else None, "prio": job["prio"]}
+
+
+def loop():
+    while True:
+        for cl in CONFIG["clusters"]:
+            refresh(cl)
+        time.sleep(max(60, CONFIG["refresh_minutes"] * 60))
+
+
+def open_login(alias):
+    cmd = "ssh %s true && echo '登录成功，可以关掉这个窗口。'" % alias
+    script = 'tell application "Terminal"\nactivate\ndo script "%s"\nend tell' % cmd.replace('"', '\\"')
+    subprocess.Popen(["osascript", "-e", script])
+
+
+# ---------------------------------------------------------------- http
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def _send(self, code, body, ctype="application/json; charset=utf-8"):
+        if isinstance(body, (dict, list)):
+            body = json.dumps(body, default=str).encode()
+        elif isinstance(body, str):
+            body = body.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _json_body(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        return json.loads(self.rfile.read(n) or b"{}")
+
+    def do_GET(self):
+        if self.path in ("/", "/index.html"):
+            with open(os.path.join(HERE, "ui", "index.html"), "rb") as f:
+                return self._send(200, f.read(), "text/html; charset=utf-8")
+        if self.path.startswith("/api/state"):
+            return self._send(200, {"clusters": [STATE.get(c["name"], {"name": c["name"], "alias": c["alias"]})
+                                                 for c in CONFIG["clusters"]],
+                                    "refresh_minutes": CONFIG["refresh_minutes"], "server_time": time.time()})
+        return self._send(404, {"error": "not found"})
+
+    def do_POST(self):
+        # Only accept requests from our own page (simple CSRF guard).
+        origin = self.headers.get("Origin", "")
+        if origin and not origin.startswith("http://127.0.0.1"):
+            return self._send(403, {"error": "forbidden"})
+        body = self._json_body()
+        name = body.get("cluster")
+        cl = next((c for c in CONFIG["clusters"] if c["name"] == name), None)
+        if self.path == "/api/refresh":
+            for c in ([cl] if cl else CONFIG["clusters"]):
+                threading.Thread(target=refresh, args=(c,), daemon=True).start()
+            return self._send(200, {"ok": True})
+        if self.path == "/api/login" and cl:
+            open_login(cl["alias"])
+            return self._send(200, {"ok": True})
+        if self.path == "/api/whatif" and cl:
+            try:
+                return self._send(200, whatif(name, body["partition"], int(body["gpus"]), float(body["hours"])))
+            except Exception as e:
+                return self._send(200, {"error": str(e)})
+        return self._send(404, {"error": "not found"})
+
+
+def main():
+    port = int(os.environ.get("QMON_PORT", CONFIG["port"]))
+    srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    threading.Thread(target=loop, daemon=True).start()
+    print("Queue Monitor on http://127.0.0.1:%d" % port, flush=True)
+    srv.serve_forever()
+
+
+if __name__ == "__main__":
+    main()

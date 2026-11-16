@@ -1,0 +1,375 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Queue Monitor</title>
+<style>
+:root {
+  color-scheme: light;
+  --bg: #f4f4f1; --surface: #fcfcfb; --surface-2: #f0efeb;
+  --text: #0b0b0b; --text-2: #52514e; --muted: #7d7c76;
+  --grid: #e1e0d9; --axis: #c3c2b7; --border: rgba(11,11,11,0.10);
+  --s1: #2a78d6; --s2: #eb6834; --band: rgba(42,120,214,0.10);
+  --good: #0ca30c; --good-text: #006300; --warn: #fab219; --serious: #ec835a; --critical: #d03b3b;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --bg: #111110; --surface: #1a1a19; --surface-2: #232321;
+    --text: #f0efec; --text-2: #c3c2b7; --muted: #8f8e86;
+    --grid: #2c2c2a; --axis: #383835; --border: rgba(255,255,255,0.10);
+    --s1: #3987e5; --s2: #d95926; --band: rgba(57,135,229,0.16); --good-text: #0ca30c;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text);
+  font: 14px/1.45 -apple-system, BlinkMacSystemFont, "PingFang SC", "Helvetica Neue", sans-serif; }
+header { position: sticky; top: 0; z-index: 5; background: var(--bg); border-bottom: 1px solid var(--border);
+  display: flex; align-items: center; gap: 12px; padding: 10px 20px; flex-wrap: wrap; }
+h1 { font-size: 16px; margin: 0 8px 0 0; font-weight: 650; }
+.tabs { display: flex; gap: 4px; }
+.tab { border: 1px solid var(--border); background: var(--surface); color: var(--text-2); padding: 5px 12px;
+  border-radius: 8px; cursor: pointer; font: inherit; }
+.tab.on { color: var(--text); border-color: var(--s1); box-shadow: inset 0 0 0 1px var(--s1); }
+.spacer { flex: 1; }
+.btn { border: 1px solid var(--border); background: var(--surface); color: var(--text); padding: 5px 12px;
+  border-radius: 8px; cursor: pointer; font: inherit; }
+.btn:hover { background: var(--surface-2); }
+.btn.primary { background: var(--s1); color: #fff; border-color: transparent; }
+.status { display: inline-flex; align-items: center; gap: 6px; color: var(--text-2); font-size: 13px; }
+.dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+main { max-width: 1180px; margin: 0 auto; padding: 18px 20px 60px; }
+.banner { background: var(--surface); border: 1px solid var(--critical); border-radius: 10px; padding: 10px 14px;
+  margin-bottom: 14px; display: flex; gap: 12px; align-items: center; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-bottom: 18px; }
+.tile { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 12px 14px; }
+.tile .k { color: var(--text-2); font-size: 12px; }
+.tile .v { font-size: 22px; font-weight: 650; margin-top: 2px; font-variant-numeric: tabular-nums; }
+.tile .s { color: var(--muted); font-size: 12px; margin-top: 2px; }
+h2 { font-size: 15px; margin: 22px 0 10px; font-weight: 650; }
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 14px 16px; margin-bottom: 12px; }
+.jobhead { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+.jobname { font-weight: 650; font-size: 15px; }
+.meta { color: var(--text-2); font-size: 13px; }
+.badge { font-size: 12px; padding: 1px 8px; border-radius: 10px; border: 1px solid var(--border); display: inline-flex; gap: 5px; align-items: center; }
+.range { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin: 12px 0 6px; }
+.range div { background: var(--surface-2); border-radius: 10px; padding: 8px 10px; }
+.range .k { font-size: 12px; color: var(--text-2); }
+.range .v { font-size: 17px; font-weight: 650; font-variant-numeric: tabular-nums; }
+.range .s { font-size: 12px; color: var(--muted); }
+.range .mid { box-shadow: inset 0 0 0 1px var(--s1); }
+.charts { display: grid; grid-template-columns: 1.4fr 1fr; gap: 14px; margin-top: 10px; }
+@media (max-width: 820px) { .charts { grid-template-columns: 1fr; } .range { grid-template-columns: 1fr; } }
+.chart { position: relative; }
+.chart .title { font-size: 12px; color: var(--text-2); margin-bottom: 4px; }
+.legend { display: flex; gap: 14px; font-size: 12px; color: var(--text-2); margin-bottom: 2px; }
+.legend i { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 5px; vertical-align: -1px; }
+svg text { fill: var(--muted); font-size: 11px; }
+.tip { position: absolute; pointer-events: none; background: var(--surface); border: 1px solid var(--border);
+  border-radius: 8px; padding: 6px 8px; font-size: 12px; box-shadow: 0 4px 16px rgba(0,0,0,0.12); display: none; white-space: nowrap; z-index: 3; }
+.bar { height: 8px; background: var(--surface-2); border-radius: 4px; overflow: hidden; margin: 10px 0 4px; }
+.bar > div { height: 100%; background: var(--s1); border-radius: 4px; }
+pre { background: var(--surface-2); padding: 8px 10px; border-radius: 8px; overflow-x: auto; font-size: 12px; margin: 8px 0 0; max-height: 260px; }
+details summary { cursor: pointer; color: var(--text-2); font-size: 13px; margin-top: 8px; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; font-variant-numeric: tabular-nums; }
+th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--grid); }
+th { color: var(--text-2); font-weight: 550; }
+.whatif { display: flex; gap: 10px; align-items: end; flex-wrap: wrap; }
+.whatif label { display: flex; flex-direction: column; font-size: 12px; color: var(--text-2); gap: 3px; }
+select, input { font: inherit; padding: 5px 8px; border-radius: 8px; border: 1px solid var(--border); background: var(--surface); color: var(--text); }
+input { width: 90px; }
+.note { color: var(--muted); font-size: 12px; }
+.empty { color: var(--text-2); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Queue Monitor</h1>
+  <div class="tabs" id="tabs"></div>
+  <span class="status" id="status"></span>
+  <div class="spacer"></div>
+  <button class="btn" id="refresh">刷新</button>
+</header>
+<main id="main"><p class="empty">正在读取数据……第一次连接集群需要几十秒。</p></main>
+
+<script>
+let STATE = null, CUR = null, timer = null;
+const $ = (s, el = document) => el.querySelector(s);
+const esc = s => String(s == null ? "" : s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+
+function fmtTime(t) {
+  if (!t) return "—";
+  const d = new Date(t * 1000);
+  const wd = "日一二三四五六"[d.getDay()];
+  return `${d.getMonth()+1}/${d.getDate()} 周${wd} ${String(d.getHours()).padStart(2,"0")}:${String(d.getMinutes()).padStart(2,"0")}`;
+}
+function fmtDur(s) {
+  if (s == null) return "—";
+  s = Math.max(0, s);
+  const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60);
+  if (d) return `${d} 天 ${h} 小时`;
+  if (h) return `${h} 小时 ${m} 分`;
+  return `${m} 分钟`;
+}
+function rel(t, now) {
+  if (!t) return "超过 14 天";
+  const s = t - now;
+  return s <= 0 ? "随时" : "约 " + fmtDur(s) + "后";
+}
+function ago(t) { return t ? fmtDur(Date.now() / 1000 - t) + "前" : "—"; }
+
+async function load() {
+  try {
+    const r = await fetch("/api/state");
+    STATE = await r.json();
+    if (!CUR) CUR = STATE.clusters[0].name;
+    render();
+  } catch (e) { $("#status").textContent = "本地服务没有响应"; }
+}
+async function post(path, body) {
+  const r = await fetch(path, {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)});
+  return r.json();
+}
+
+function renderTabs() {
+  $("#tabs").innerHTML = STATE.clusters.map(c => {
+    const pend = (c.jobs || []).filter(j => j.state === "PENDING").length;
+    const run = (c.jobs || []).filter(j => j.state === "RUNNING").length;
+    return `<button class="tab ${c.name === CUR ? "on" : ""}" data-c="${esc(c.name)}">${esc(c.name)}
+      <span class="meta">${run} 运行 · ${pend} 排队</span></button>`;
+  }).join("");
+  document.querySelectorAll(".tab").forEach(b => b.onclick = () => { CUR = b.dataset.c; render(); });
+}
+
+function render() {
+  renderTabs();
+  const c = STATE.clusters.find(x => x.name === CUR);
+  const st = $("#status");
+  const color = c.error ? "var(--critical)" : (c.refreshing ? "var(--warn)" : "var(--good)");
+  st.innerHTML = `<span class="dot" style="background:${color}"></span>` +
+    (c.refreshing ? "正在刷新…" : (c.updated ? `更新于 ${ago(c.updated)}` : "尚未取得数据")) +
+    ` · 每 ${STATE.refresh_minutes} 分钟自动刷新`;
+  const m = $("#main");
+  let h = "";
+  if (c.error) {
+    const login = c.socket === false;
+    h += `<div class="banner"><span class="badge" style="border-color:var(--critical)">⚠ 连接问题</span>
+      <div style="flex:1">${esc(c.error)}${c.updated ? "（下面是 " + ago(c.updated) + "的数据）" : ""}</div>
+      ${login ? `<button class="btn primary" id="login">在终端里登录</button>` : ""}</div>`;
+  }
+  if (!c.now) { m.innerHTML = h + `<p class="empty">还没有 ${esc(c.name)} 的数据。</p>`; bindBanner(c); return; }
+  h += tiles(c);
+  h += `<h2>我的任务</h2>`;
+  if (!c.jobs.length) h += `<div class="card empty">${esc(c.name)} 上现在没有你的任务。</div>`;
+  const order = {RUNNING: 0, PENDING: 1};
+  [...c.jobs].sort((a, b) => (order[a.state] ?? 2) - (order[b.state] ?? 2) || ((a.pred?.typical || 9e12) - (b.pred?.typical || 9e12)))
+    .forEach(j => h += jobCard(c, j));
+  h += whatifBox(c);
+  h += historyTable(c);
+  h += modelNotes(c);
+  m.innerHTML = h;
+  bindBanner(c);
+  c.jobs.forEach(j => { if (j.trace) drawCharts(c, j); if (j.log && j.log.loss_series && j.log.loss_series.length > 2) drawLoss(j); });
+  bindWhatif(c);
+}
+function bindBanner(c) {
+  const b = $("#login");
+  if (b) b.onclick = async () => { await post("/api/login", {cluster: c.name}); b.textContent = "已打开终端，登录后点刷新"; };
+}
+
+function tiles(c) {
+  const bal = c.balances[0];
+  const fs = c.fairshare[0];
+  const pct = bal ? Math.round(100 * bal.balance / bal.deposited) : null;
+  const cal = c.calibration;
+  return `<div class="tiles">
+    <div class="tile"><div class="k">SU 余额（${esc(bal ? bal.account : "")}）</div>
+      <div class="v">${bal ? bal.balance.toLocaleString() : "—"}</div>
+      <div class="s">共 ${bal ? bal.deposited.toLocaleString() : "—"}，剩 ${pct ?? "—"}%</div></div>
+    <div class="tile"><div class="k">公平份额（FairShare）</div>
+      <div class="v">${fs && fs.observed != null ? fs.observed.toFixed(3) : "—"}</div>
+      <div class="s">优先级里占 ${fs && fs.observed != null ? Math.round(fs.observed * c.weights.fs) : "—"} / ${c.weights.fs} 分；1.0 为最高</div></div>
+    <div class="tile"><div class="k">全集群排队</div>
+      <div class="v">${c.queue.competing.toLocaleString()}</div>
+      <div class="s">个任务在按优先级等；${c.queue.running} 个在运行</div></div>
+    <div class="tile"><div class="k">预测校准</div>
+      <div class="v">×${cal.factor.toFixed(2)}</div>
+      <div class="s">${cal.n ? `根据你最近 ${cal.n} 个任务的实际等待` : "还没有已开始的任务可用来校准"}</div></div>
+  </div>`;
+}
+
+function jobCard(c, j) {
+  let h = `<div class="card"><div class="jobhead"><span class="jobname">${esc(j.name)}</span>
+    <span class="meta">#${esc(j.id)} · ${esc(j.partition)} · ${j.gpus} 卡${j.nodes > 1 ? " / " + j.nodes + " 节点" : ""} · 时限 ${esc(j.limit)}</span>
+    ${stateBadge(j)}</div>`;
+  if (j.state === "PENDING") {
+    const p = j.pred || {};
+    h += `<div class="range">
+      <div><div class="k">最早（集群放得快）</div><div class="v">${fmtTime(p.fast)}</div><div class="s">${rel(p.fast, c.now)}</div></div>
+      <div class="mid"><div class="k">最可能</div><div class="v">${fmtTime(p.typical)}</div><div class="s">${rel(p.typical, c.now)}</div></div>
+      <div><div class="k">最晚（集群放得慢）</div><div class="v">${fmtTime(p.slow)}</div><div class="s">${rel(p.slow, c.now)}</div></div>
+    </div>`;
+    const sp = j.sprio;
+    h += `<div class="meta">现在优先级 ${Math.round(j.prio)}${sp ? `（公平份额 ${Math.round(sp.fs)} + 等待时间 ${Math.round(sp.age)} + 分区 ${Math.round(sp.part)}）` : ""}
+      · 已等 ${fmtDur(c.now - j.submit)} · Slurm 自己的估计：${fmtTime(j.start)}　原因：${esc(j.reason)}</div>`;
+    if (j.trace) h += `<div class="charts">
+      <div class="chart" id="pc-${j.id}"><div class="title">优先级随时间变化（按“最可能”的放行速度模拟）</div>
+        <div class="legend"><span><i style="background:var(--s1)"></i>这个任务的优先级</span><span><i style="background:var(--s2)"></i>被放行任务的优先级</span></div></div>
+      <div class="chart" id="ac-${j.id}"><div class="title">排在它前面的工作量（卡·小时）</div></div></div>`;
+    else if (!j.pred) h += `<div class="note" style="margin-top:8px">这个分区不在预测范围内，或任务被依赖/挂起，不参与排队。</div>`;
+  } else if (j.state === "RUNNING") {
+    const frac = j.limit_s ? Math.min(1, j.used_s / j.limit_s) : 0;
+    h += `<div class="bar"><div style="width:${(frac * 100).toFixed(1)}%"></div></div>
+      <div class="meta">已运行 ${fmtDur(j.used_s)} / ${esc(j.limit)}（${Math.round(frac * 100)}%）· 最晚 ${fmtTime(c.now + (j.left_s || 0))} 结束 · 开始于 ${fmtTime(j.start)}</div>`;
+    const lg = j.log;
+    if (lg) {
+      h += `<div class="meta" style="margin-top:6px">日志：${esc(lg.path)}${lg.last_step != null ? ` · 最新 step ${lg.last_step}` : ""}${lg.last_loss != null ? ` · 最新 loss ${lg.last_loss.toPrecision(4)}` : ""}</div>`;
+      if (lg.loss_series && lg.loss_series.length > 2) h += `<div class="chart" id="lc-${j.id}" style="margin-top:8px"><div class="title">日志里的 loss（最近 ${lg.loss_series.length} 条）</div></div>`;
+      if (lg.tail && lg.tail.length) h += `<details><summary>日志最后 ${lg.tail.length} 行</summary><pre>${esc(lg.tail.join("\n"))}</pre></details>`;
+    }
+  } else {
+    h += `<div class="meta" style="margin-top:6px">原因：${esc(j.reason)}</div>`;
+  }
+  return h + `</div>`;
+}
+function stateBadge(j) {
+  const map = {RUNNING: ["var(--good)", "● 运行中"], PENDING: ["var(--warn)", "◔ 排队中"]};
+  const [c, t] = map[j.state] || ["var(--axis)", j.state];
+  return `<span class="badge" style="border-color:${c}">${t}</span>`;
+}
+
+// ------------------------------------------------------------ charts (inline SVG)
+function axisTicks(lo, hi, n) {
+  const span = hi - lo || 1, step0 = span / n, mag = Math.pow(10, Math.floor(Math.log10(step0)));
+  const step = [1, 2, 2.5, 5, 10].map(x => x * mag).find(x => x >= step0);
+  const out = []; for (let v = Math.ceil(lo / step) * step; v <= hi + 1e-9; v += step) out.push(+v.toFixed(6));
+  return out;
+}
+function frame(el, W, H, xmax, ylo, yhi, now, yfmt) {
+  const L = 44, R = 10, T = 8, B = 22;
+  const x = t => L + (W - L - R) * t / xmax, y = v => T + (H - T - B) * (1 - (v - ylo) / (yhi - ylo || 1));
+  let g = "";
+  axisTicks(ylo, yhi, 4).forEach(v => g += `<line x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}" stroke="var(--grid)"/>
+    <text x="${L - 6}" y="${y(v) + 4}" text-anchor="end">${yfmt(v)}</text>`);
+  const dayStep = xmax > 120 ? 48 : 24;
+  for (let t = 0; t <= xmax; t += dayStep) g += `<text x="${x(t)}" y="${H - 6}" text-anchor="middle">${t === 0 ? "现在" : fmtTime(now + t * 3600).split(" ")[0]}</text>`;
+  g += `<line x1="${L}" x2="${W - R}" y1="${H - B}" y2="${H - B}" stroke="var(--axis)"/>`;
+  return {x, y, g, L, R, T, B};
+}
+function svgWrap(W, H, inner) { return `<svg viewBox="0 0 ${W} ${H}" width="100%" height="${H}" preserveAspectRatio="none">${inner}</svg>`; }
+function addHover(el, svg, W, f, xmax, pts, label) {
+  const tip = document.createElement("div"); tip.className = "tip"; el.appendChild(tip);
+  const cross = document.createElementNS("http://www.w3.org/2000/svg", "line");
+  cross.setAttribute("stroke", "var(--axis)"); cross.setAttribute("y1", f.T); cross.setAttribute("y2", 1000); cross.style.display = "none";
+  svg.appendChild(cross);
+  svg.addEventListener("mousemove", ev => {
+    const r = svg.getBoundingClientRect(), px = (ev.clientX - r.left) * W / r.width;
+    const t = (px - f.L) / (W - f.L - f.R) * xmax;
+    let best = null; pts.forEach(p => { if (p && (best == null || Math.abs(p[0] - t) < Math.abs(best[0] - t))) best = p; });
+    if (!best) return;
+    cross.setAttribute("x1", f.x(best[0])); cross.setAttribute("x2", f.x(best[0])); cross.style.display = "";
+    tip.style.display = "block"; tip.innerHTML = label(best);
+    const left = ev.clientX - el.getBoundingClientRect().left;
+    tip.style.left = Math.min(left + 12, el.clientWidth - tip.offsetWidth - 4) + "px"; tip.style.top = "30px";
+  });
+  svg.addEventListener("mouseleave", () => { tip.style.display = "none"; cross.style.display = "none"; });
+}
+function drawCharts(c, j) {
+  const tr = j.trace, now = c.now, p = j.pred || {};
+  const startH = p.typical ? (p.typical - now) / 3600 : tr.t[tr.t.length - 1];
+  const slowH = p.slow ? (p.slow - now) / 3600 : startH, fastH = p.fast ? (p.fast - now) / 3600 : startH;
+  const xmax = Math.max(24, Math.ceil((Math.max(slowH, startH) * 1.15) / 12) * 12);
+  const mine = tr.t.map((t, i) => tr.mine[i] == null ? null : [t, tr.mine[i]]).filter(p => p && p[0] <= xmax);
+  const cut = tr.cut.filter(p => p[0] <= xmax);
+  // priority chart
+  {
+    const el = $("#pc-" + j.id), W = 640, H = 200;
+    const vals = mine.map(p => p[1]).concat(cut.map(p => p[1]));
+    const ylo = Math.max(0, Math.min(...vals) * 0.9), yhi = Math.max(...vals) * 1.05;
+    const f = frame(el, W, H, xmax, ylo, yhi, now, v => Math.round(v));
+    let g = `<rect x="${f.x(Math.max(0, fastH))}" y="${f.T}" width="${Math.max(2, f.x(Math.min(slowH, xmax)) - f.x(Math.max(0, fastH)))}" height="${H - f.T - f.B}" fill="var(--band)"/>` + f.g;
+    // thin cutline dots: downsample to <= 300
+    const step = Math.max(1, Math.ceil(cut.length / 300));
+    cut.filter((_, i) => i % step === 0).forEach(p => g += `<circle cx="${f.x(p[0])}" cy="${f.y(Math.min(p[1], yhi))}" r="2" fill="var(--s2)" opacity="0.55"/>`);
+    g += `<path d="${mine.map((p, i) => (i ? "L" : "M") + f.x(p[0]).toFixed(1) + "," + f.y(p[1]).toFixed(1)).join("")}" fill="none" stroke="var(--s1)" stroke-width="2"/>`;
+    if (p.typical) g += `<line x1="${f.x(startH)}" x2="${f.x(startH)}" y1="${f.T}" y2="${H - f.B}" stroke="var(--s1)" stroke-dasharray="3 3"/>
+      <text x="${f.x(startH) + 4}" y="${f.T + 10}" style="fill:var(--text-2)">最可能开始</text>`;
+    el.insertAdjacentHTML("beforeend", svgWrap(W, H, g));
+    addHover(el, el.querySelector("svg"), W, f, xmax, mine, q => `${fmtTime(now + q[0] * 3600)}<br>这个任务的优先级 <b>${Math.round(q[1])}</b>`);
+  }
+  // work ahead chart
+  {
+    const el = $("#ac-" + j.id), W = 420, H = 200;
+    const pts = tr.t.map((t, i) => tr.ahead[i] == null ? null : [t, tr.ahead[i]]).filter(p => p && p[0] <= Math.min(xmax, startH + 1));
+    if (!pts.length) return;
+    const yhi = Math.max(...pts.map(p => p[1])) * 1.1 || 1;
+    const f = frame(el, W, H, xmax, 0, yhi, now, v => v >= 1000 ? (v / 1000).toFixed(1) + "k" : Math.round(v));
+    let g = f.g + `<path d="${pts.map((p, i) => (i ? "L" : "M") + f.x(p[0]).toFixed(1) + "," + f.y(p[1]).toFixed(1)).join("")}" fill="none" stroke="var(--s1)" stroke-width="2"/>`;
+    el.insertAdjacentHTML("beforeend", svgWrap(W, H, g));
+    addHover(el, el.querySelector("svg"), W, f, xmax, pts, q => `${fmtTime(now + q[0] * 3600)}<br>前面还有 <b>${Math.round(q[1]).toLocaleString()}</b> 卡·小时`);
+  }
+}
+function drawLoss(j) {
+  const el = $("#lc-" + j.id), W = 640, H = 160, s = j.log.loss_series;
+  const pts = s.map((m, i) => [m.step != null ? m.step : i, m.loss]);
+  const x0 = pts[0][0], x1 = pts[pts.length - 1][0] || 1;
+  const ys = pts.map(p => p[1]), ylo = Math.min(...ys), yhi = Math.max(...ys);
+  const L = 50, R = 10, T = 8, B = 20;
+  const x = v => L + (W - L - R) * (v - x0) / ((x1 - x0) || 1), y = v => T + (H - T - B) * (1 - (v - ylo) / ((yhi - ylo) || 1));
+  let g = "";
+  axisTicks(ylo, yhi, 3).forEach(v => g += `<line x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}" stroke="var(--grid)"/><text x="${L - 6}" y="${y(v) + 4}" text-anchor="end">${(+v).toPrecision(3)}</text>`);
+  g += `<text x="${L}" y="${H - 4}">step ${x0}</text><text x="${W - R}" y="${H - 4}" text-anchor="end">step ${x1}</text>`;
+  g += `<path d="${pts.map((p, i) => (i ? "L" : "M") + x(p[0]).toFixed(1) + "," + y(p[1]).toFixed(1)).join("")}" fill="none" stroke="var(--s1)" stroke-width="2"/>`;
+  el.insertAdjacentHTML("beforeend", svgWrap(W, H, g));
+}
+
+// ------------------------------------------------------------ what-if, history, notes
+function whatifBox(c) {
+  const opts = (c.whatif_partitions || []).map(p => `<option>${esc(p)}</option>`).join("");
+  return `<h2>如果现在提交一个新任务</h2><div class="card">
+    <div class="whatif">
+      <label>分区<select id="wi-part">${opts}</select></label>
+      <label>GPU 数<input id="wi-gpus" type="number" min="1" value="4"></label>
+      <label>时限（小时）<input id="wi-hours" type="number" min="0.5" step="0.5" value="40"></label>
+      <button class="btn primary" id="wi-go">估计开始时间</button>
+    </div>
+    <div id="wi-out" class="meta" style="margin-top:10px">只做估计，不会提交任何任务。</div></div>`;
+}
+function bindWhatif(c) {
+  const b = $("#wi-go"); if (!b) return;
+  b.onclick = async () => {
+    const out = $("#wi-out"); out.textContent = "正在模拟…";
+    const r = await post("/api/whatif", {cluster: c.name, partition: $("#wi-part").value, gpus: +$("#wi-gpus").value, hours: +$("#wi-hours").value});
+    if (r.error) { out.textContent = r.error; return; }
+    const s = r.start || {};
+    out.innerHTML = `起始优先级约 ${Math.round(r.prio)}。最早 <b>${fmtTime(s.fast)}</b>（${rel(s.fast, r.now)}），最可能 <b>${fmtTime(s.typical)}</b>（${rel(s.typical, r.now)}），最晚 <b>${fmtTime(s.slow)}</b>（${rel(s.slow, r.now)}）。`;
+  };
+}
+function historyTable(c) {
+  if (!c.history.length) return "";
+  const rows = c.history.slice(0, 25).map(r => {
+    const wait = r.start && r.eligible ? fmtDur(r.start - r.eligible) : "—";
+    return `<tr><td>${esc(r.name)}</td><td class="meta">${esc(r.id)}</td><td>${esc(r.partition)}</td><td>${r.gpus}</td>
+      <td>${esc(r.state)}</td><td>${fmtTime(r.submit)}</td><td>${wait}</td><td>${esc(r.elapsed)}</td></tr>`;
+  }).join("");
+  return `<h2>最近 14 天的任务</h2><div class="card" style="overflow-x:auto"><table>
+    <tr><th>名字</th><th>编号</th><th>分区</th><th>GPU</th><th>状态</th><th>提交</th><th>等了</th><th>跑了</th></tr>${rows}</table></div>`;
+}
+function modelNotes(c) {
+  const pools = Object.entries(c.pools).map(([k, p]) =>
+    `${esc(k)}：现在忙着的 GPU ≈ ${Math.round(p.busy_now || 0)}，放行速度 慢/常/快 = ${Math.round(p.slow)}/${Math.round(p.typical)}/${Math.round(p.fast)} 卡·小时每小时；${Math.round(p.quick_share * 100)}% 的工作是提交后 6 小时内就开始的（插队或回填）；过去 3 天 ${p.n_starts} 个任务开始。`).join("<br>");
+  const fs = c.fairshare[0];
+  const chk = c.model_check != null ? `公平份额模型自检：和 sshare 的平均差 ${c.model_check.toFixed(3)}${fs && fs.model != null ? `，你的模型值 ${fs.model.toFixed(3)} vs 实际 ${fs.observed != null ? fs.observed.toFixed(3) : "—"}` : ""}。` : "";
+  return `<h2>模型说明</h2><div class="card note">
+    预测方法：每个排队任务的优先级 = 公平份额 × ${c.weights.fs} + 等待时间（${Math.round(c.weights.max_age_s / 86400)} 天内涨到 ${c.weights.age}）+ 分区。
+    公平份额按 Fair Tree 规则模拟：使用量每 ${Math.round(c.weights.half_life_s / 3600)} 小时减半，正在跑和模拟中开始的任务会增加使用量。
+    集群按历史速度放行，先放优先级高的。预测结果再乘以校准系数（用你过去任务的实际等待修正）。<br><br>${pools}<br><br>${chk}</div>`;
+}
+
+$("#refresh").onclick = async () => { await post("/api/refresh", {cluster: CUR}); setTimeout(load, 400); };
+load();
+setInterval(load, 15000);
+</script>
+</body>
+</html>
