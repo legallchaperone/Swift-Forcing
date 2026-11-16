@@ -337,7 +337,9 @@ def run(cfg_cluster, data_dir, snap_now, days=21, step_h=6, lookback_d=5, guard_
         log("fetching %d days of sacct history for %s ..." % (days, name))
         fetch_history(cfg_cluster["alias"], cfg_cluster["partitions"], days, hpath)
     fetched_at, jobs = load_history(hpath, cfg_cluster)
-    t_first = min(j["elig"] for j in jobs if j["elig"])
+    # sacct -S only returns jobs still active after the cut-off, so the queue can only be rebuilt
+    # for times after it (the earliest end time); before it, short jobs would be missing.
+    t_first = min(j["end"] for j in jobs if j["end"])
     jobs_by_pool = {}
     for j in jobs:
         jobs_by_pool.setdefault(j["pool"], []).append(j)
@@ -427,35 +429,56 @@ def run(cfg_cluster, data_dir, snap_now, days=21, step_h=6, lookback_d=5, guard_
     return res
 
 
-def run_live(cfg_cluster, data_dir, jobs, fetched_at, guard_d):
-    """Score archived live snapshots (exact inputs, includes Slurm's own estimate)."""
-    from qmon import archive
+def run_live(cfg_cluster, data_dir, jobs, fetched_at, guard_d, live_guard_d=2):
+    """Score archived live snapshots (exact inputs, includes Slurm's own estimate).
+
+    Jobs that had not started when the history was fetched are left out, so
+    snapshots younger than `guard_d` days favour short waits; this is the same for
+    every algorithm, so the comparison stays fair. The learned model is scored
+    only on snapshots taken after its training data ends.
+    """
+    from qmon import archive, features, mlmodel
     truth = {j["id"]: (j["start"], j["end"]) for j in jobs}
-    algos = ["slurm", "rule", "rule-static"]
+    lm = mlmodel.Model.load(mlmodel.default_path(data_dir, cfg_cluster["name"]))
+    lm_after = lm.d["trained_on"]["fetched"] if lm else None
+    algos = ["slurm", "rule", "rule-static"] + (["learned", "slurm@learned"] if lm else [])
     rows = {a: [] for a in algos}
     n_snaps = 0
     for path in archive.list_snapshots(data_dir, cfg_cluster["name"]):
         sec = archive.load(path)
         snap = model.parse_snapshot(sec, cfg_cluster)
         T = snap["now"]
-        if T > fetched_at - guard_d * 86400:
+        if T > fetched_at - live_guard_d * 86400:
             continue
         n_snaps += 1
-        rule = cand_rule(snap, cfg_cluster)
+        pr = model.predict(snap, cfg_cluster, log_all=True)
+        rule = {}
+        for jid, v in pr["all"].items():
+            if v.get("typical") is not None:
+                ty = v["typical"]
+                rule[jid] = (min(v.get("fast") or ty, ty), ty, max(v.get("slow") or ty, ty))
         static = cand_rule(snap, cfg_cluster, static=True)
+        want = {j["id"] for j in snap["pending"] if j["competing"] and j.get("slurm_est")
+                and j["id"] in truth and truth[j["id"]][0] is not None}
+        lf = {}
+        if lm and T > lm_after:
+            lf = features.compute(snap, cfg_cluster, pr["all"], features.hist_jobs_from_snap(snap), only=want)
         for j in snap["pending"]:
-            if not j["competing"] or j["id"] not in truth or truth[j["id"]][0] is None:
+            if j["id"] not in want or j["id"] not in rule or j["id"] not in static:
                 continue
-            st = truth[j["id"]][0]
-            y = (st - T) / 3600.0
-            if y < 0 or j["id"] not in rule or j["id"] not in static or not j.get("slurm_est"):
+            y = (truth[j["id"]][0] - T) / 3600.0
+            if y < 0:
                 continue
             se = max((j["slurm_est"] - T) / 3600.0, 0.0)
-            for a, p in (("slurm", (se, se, se)),
-                         ("rule", tuple(max((x - T) / 3600.0, 0) for x in rule[j["id"]])),
-                         ("rule-static", tuple(max((x - T) / 3600.0, 0) for x in static[j["id"]]))):
-                rows[a].append((p, y))
-    return {"snapshots": n_snaps, "overall": {a: score(rows[a]) for a in algos}, "algos": algos}
+            rows["slurm"].append(((se, se, se), y))
+            rows["rule"].append((tuple(max((x - T) / 3600.0, 0) for x in rule[j["id"]]), y))
+            rows["rule-static"].append((tuple(max((x - T) / 3600.0, 0) for x in static[j["id"]]), y))
+            q = lm.predict(lf[j["id"]]) if j["id"] in lf else None
+            if q:
+                rows["learned"].append((tuple(q), y))
+                rows["slurm@learned"].append(((se, se, se), y))
+    return {"snapshots": n_snaps, "overall": {a: score(rows[a]) for a in algos}, "algos": algos,
+            "note": "slurm@learned: Slurm's estimate on exactly the jobs the learned model was scored on"}
 
 
 def main():

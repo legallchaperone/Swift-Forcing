@@ -15,7 +15,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 
-from qmon import archive, bench, calib, collect, model  # noqa: E402
+from qmon import archive, bench, calib, collect, features, mlmodel, model, retrain  # noqa: E402
 
 DATA_DIR = os.path.expanduser("~/Library/Application Support/QueueMonitor")
 CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
@@ -65,6 +65,33 @@ LAST_SEC = {}     # cluster name -> raw sections of the last refresh
 BENCH = {}        # cluster name -> latest backtest results
 BENCH_STATUS = {}
 BUSY = set()
+MODELS = {}       # cluster name -> learned model (qmon.mlmodel), when one has been trained
+LEARN_STATUS = {}
+
+
+def load_models():
+    for cl in CONFIG["clusters"]:
+        m = mlmodel.Model.load(mlmodel.default_path(DATA_DIR, cl["name"]))
+        if m:
+            MODELS[cl["name"]] = m
+
+
+def apply_learned(name, cl, snap, preds):
+    """Replace the range of each of my pending jobs by the learned model's 10/50/90% range."""
+    m = MODELS.get(name)
+    if not m or not preds["jobs"]:
+        return
+    feats = features.compute(snap, cl, preds["all"], features.hist_jobs_from_snap(snap), only=set(preds["jobs"]))
+    now = snap["now"]
+    for jid, p in preds["jobs"].items():
+        f = feats.get(jid)
+        q = m.predict(f) if f else None
+        if not q:
+            continue
+        p["rule_range"] = p["start"]
+        p["start"] = {"fast": now + q[0] * 3600, "typical": now + q[1] * 3600, "slow": now + q[2] * 3600}
+        p["method"] = "learned"
+        p["calibrated"] = True
 NOTES_PATH = os.path.join(DATA_DIR, "notes.json")
 NOTES_LOCK = threading.Lock()
 
@@ -113,7 +140,11 @@ def refresh(cl):
         snap = model.parse_snapshot(sec, cl)
         fn, report = STORE.calibrator(name, snap["now"])
         preds = model.predict(snap, cl, calibrator=fn, log_all=True)
-        STORE.record(name, snap, preds)
+        STORE.record(name, snap, preds)          # logs the rule simulation (the calibration needs it)
+        try:
+            apply_learned(name, cl, snap, preds)
+        except Exception:
+            traceback.print_exc()
         SNAPS[name] = snap
         LAST_SEC[name] = sec
         try:
@@ -192,6 +223,15 @@ def loop():
         time.sleep(max(60, CONFIG["refresh_minutes"] * 60))
 
 
+def load_study(name):
+    p = os.path.join(DATA_DIR, "bench", "%s_study.json" % name)
+    try:
+        with open(p) as f:
+            return json.load(f)
+    except (IOError, OSError, ValueError):
+        return None
+
+
 def load_bench():
     for cl in CONFIG["clusters"]:
         p = os.path.join(DATA_DIR, "bench", "%s_results.json" % cl["name"])
@@ -215,6 +255,17 @@ def bench_loop():
             last = BENCH.get(name, {}).get("generated", 0)
             if time.time() - last < 20 * 3600 or name not in LAST_SEC:
                 continue
+            if retrain.available() and (retrain.model_age(name) or 1e12) > retrain.MAX_AGE_S:
+                LEARN_STATUS[name] = "training"
+                try:
+                    retrain.run(cl, log=lambda *a: None)
+                    m = mlmodel.Model.load(mlmodel.default_path(DATA_DIR, name))
+                    if m:
+                        MODELS[name] = m
+                    LEARN_STATUS[name] = "ok"
+                except Exception as e:
+                    LEARN_STATUS[name] = "error: %s" % e
+                    traceback.print_exc()
             BENCH_STATUS[name] = "running"
             try:
                 snap = model.parse_snapshot(LAST_SEC[name], cl)   # private copy of the tree
@@ -260,7 +311,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, f.read(), "text/html; charset=utf-8")
         if self.path.startswith("/api/state"):
             return self._send(200, {"clusters": [dict(STATE.get(c["name"], {"name": c["name"], "alias": c["alias"]}),
-                                                      bench=BENCH.get(c["name"]), bench_status=BENCH_STATUS.get(c["name"]))
+                                                      bench=BENCH.get(c["name"]), bench_status=BENCH_STATUS.get(c["name"]),
+                                                      learned=(MODELS[c["name"]].d["trained_on"] if c["name"] in MODELS else None),
+                                                      learn_status=LEARN_STATUS.get(c["name"]),
+                                                      study=load_study(c["name"]))
                                                  for c in CONFIG["clusters"]],
                                     "notes": load_notes(),
                                     "refresh_minutes": CONFIG["refresh_minutes"], "server_time": time.time()})
@@ -294,6 +348,7 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     port = int(os.environ.get("QMON_PORT", CONFIG["port"]))
     srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    load_models()
     threading.Thread(target=loop, daemon=True).start()
     threading.Thread(target=bench_loop, daemon=True).start()
     print("Queue Monitor on http://127.0.0.1:%d" % port, flush=True)

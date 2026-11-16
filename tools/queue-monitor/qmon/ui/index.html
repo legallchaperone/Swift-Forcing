@@ -315,7 +315,7 @@ function detailHTML(c, j) {
     h += fact("已经等了", dur(c.now - j.submit, true));
     h += fact("Slurm 自己的估计", j.start ? when(j.start, c.now) : "—");
     h += fact("时限", esc(j.limit));
-    h += fact("算法", j.method === "blend" ? (j.calibrated ? "规则模型 + 校准 + 历史等待" : "规则模型 + 历史等待 <small>校准数据还不够</small>")
+    h += fact("算法", j.method === "learned" ? "学习模型 <small>三种预测的组合，每周重训</small>" : j.method === "blend" ? (j.calibrated ? "规则模型 + 校准 + 历史等待" : "规则模型 + 历史等待 <small>校准数据还不够</small>")
       : j.calibrated ? "规则模型 + 校准" : "规则模型 <small>校准数据还不够</small>");
   } else if (j.state === "RUNNING") {
     h += fact("开始于", when(j.start, c.now));
@@ -506,7 +506,9 @@ function whatif(c) {
 }
 const ALGO = {
   "blend": ["规则模型 + 分组校准 + 历史等待", "两者在对数尺度上平均"],
-  "rule+cal2": ["规则模型 + 分组校准", "现在在用"],
+  "learned": ["学习模型", "现在在用：规则模型、两个排序模型和分组校准的组合"],
+  "slurm@learned": ["Slurm 自己的估计", "和学习模型同一批任务"],
+  "rule+cal2": ["规则模型 + 分组校准", "以前在用"],
   "rule+cal": ["规则模型 + 统一校准", "只按等待长短分组"],
   "rule": ["规则模型", "不校准"],
   "rule-static": ["规则模型，优先级不变", "去掉公平份额和等待时间的变化"],
@@ -529,9 +531,24 @@ function lbTable(overall, algos) {
     ${cell(a, "pinball_h", v => v.toFixed(1), "min")}</tr>`).join("");
   return `<table><tr><th>算法（按综合分排序）</th><th>中位误差</th><th>中位偏差倍数</th><th>区间命中（目标 80%）</th><th>综合分（越小越好）</th></tr>${rows}</table>`;
 }
+function studyTable(st) {
+  const r = st.results, order = ["learned", "cal2", "rule"].filter(a => r[a]);
+  const name = {learned: ["学习模型", "现在在用"], cal2: ["规则模型 + 分组校准", "以前在用"], rule: ["规则模型", "不校准"]};
+  const pct = v => v == null ? "—" : Math.round(v * 100) + "%";
+  const rows = order.map(a => { const o = r[a], cb = o.coverage_by_real_wait || {};
+    return `<tr><td><b style="font-weight:${a === "learned" ? 600 : 500}">${name[a][0]}</b><div class="jmeta">${name[a][1]}</div></td>
+      <td class="num">${dur(o.median_abs_err_h * 3600, true)}</td><td class="num">${dur(o.users_equal_err_h * 3600, true)}</td>
+      <td class="num">${pct(o.coverage_10_90)}</td><td class="num">${o.pinball_h.toFixed(1)}</td>
+      <td class="num">${["<6h", "6-24h", "1-3d", ">3d"].map(k => pct(cb[k])).join(" · ")}</td></tr>`; }).join("");
+  return `<table><tr><th>算法</th><th>中位误差</th><th>每个用户同权</th><th>区间命中（目标 80%）</th><th>综合分</th>
+    <th>按实际等待分档的命中<br><small>&lt;6h · 6–24h · 1–3d · &gt;3d</small></th></tr>${rows}</table>
+    <div class="note">${day(st.span[1] - 7 * 86400 * Math.max(...st.folds))} 起的 ${st.folds.length} 周，每周都只用更早的数据训练，再预测这一周（共 ${r[order[0]].n.toLocaleString()} 次预测）。
+    「每个用户同权」：一个人排了几百个任务时，这些任务合起来只算一份，更接近单个任务的体验。</div>`;
+}
 function leaderboard(c) {
   const b = c.bench;
-  const head = `<div class="section"><h2>算法排行榜（回测）</h2><span class="hint">每天自动重跑</span></div>`;
+  let head = `<div class="section"><h2>算法排行榜（回测）</h2><span class="hint">每天自动重跑</span></div>`;
+  if (c.study && c.study.results) head = `<div class="section"><h2>学习模型 vs 旧方法</h2><span class="hint">每周重训时重算</span></div><div class="card">${studyTable(c.study)}</div>` + head;
   if (!b) return head + `<div class="card note">${c.bench_status === "running" ? "正在跑第一次回测，大约需要几分钟。" :
     (c.bench_status || "").startsWith("error") ? "回测出错：" + esc(c.bench_status) : "应用启动几分钟后会自动跑第一次回测。"}</div>`;
   const span = b.window ? `${day(b.window[0])} 到 ${day(b.window[1])}` : "";
