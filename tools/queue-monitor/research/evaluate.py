@@ -145,12 +145,14 @@ def two_stage(tr, dur, ev, te, nbins=12, rounds=200, min_events=40, raw=False):
 
 
 def widen(P, f):
-    """Stretch the 10% and 90% points away from the median by factor f, in log(hours + 1) space."""
-    if f == 1:
+    """Stretch the 10% and 90% points away from the median, in log(hours + 1) space.
+    f is one factor for both sides, or a (lower, upper) pair."""
+    lo, up = f if isinstance(f, tuple) else (f, f)
+    if lo == 1 and up == 1:
         return P
     L = np.log1p(np.maximum(P, 0))
-    L[:, 0] = L[:, 1] - f * (L[:, 1] - L[:, 0])
-    L[:, 2] = L[:, 1] + f * (L[:, 2] - L[:, 1])
+    L[:, 0] = L[:, 1] - lo * (L[:, 1] - L[:, 0])
+    L[:, 2] = L[:, 1] + up * (L[:, 2] - L[:, 1])
     return np.expm1(np.maximum(L, 0))
 
 
@@ -196,7 +198,8 @@ def run(df, folds, fold_days, models, train_sel=True, train_days=None, widen_f=(
     for name, (Ps, Ys, Ws) in out.items():
         P, y, w = np.concatenate(Ps), np.concatenate(Ys), np.concatenate(Ws)
         for f in widen_f:
-            print(line(name if f == 1 else "%s x%.2g" % (name, f), widen(P, f), y, w), flush=True)
+            tag = name if f == 1 else ("%s x%.2g/%.2g" % (name, f[0], f[1]) if isinstance(f, tuple) else "%s x%.2g" % (name, f))
+            print(line(tag, widen(P, f), y, w), flush=True)
         res[name] = (P, y, w)
     return res
 
@@ -213,4 +216,4 @@ if __name__ == "__main__":
     fetched, df = load(a.path)
     print("rows %d, points %d, span %.1f days" % (len(df), df["T"].nunique(), (df["T"].max() - df["T"].min()) / 86400))
     run(df, [int(x) for x in a.folds.split(",")], a.fold_days, a.models.split(","), train_days=a.train_days,
-        widen_f=[float(x) for x in a.widen.split(",")])
+        widen_f=[tuple(float(v) for v in x.split(":")) if ":" in x else float(x) for x in a.widen.split(",")])
