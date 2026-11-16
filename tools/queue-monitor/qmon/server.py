@@ -65,6 +65,33 @@ LAST_SEC = {}     # cluster name -> raw sections of the last refresh
 BENCH = {}        # cluster name -> latest backtest results
 BENCH_STATUS = {}
 BUSY = set()
+NOTES_PATH = os.path.join(DATA_DIR, "notes.json")
+NOTES_LOCK = threading.Lock()
+
+
+def load_notes():
+    try:
+        with open(NOTES_PATH) as f:
+            return json.load(f)
+    except (IOError, OSError, ValueError):
+        return {}
+
+
+def save_note(cluster, job_id, text):
+    """Notes are {cluster: {job id: text}}; an empty text deletes the note."""
+    with NOTES_LOCK:
+        notes = load_notes()
+        per = notes.setdefault(cluster, {})
+        text = (text or "").strip()[:2000]
+        if text:
+            per[str(job_id)] = text
+        else:
+            per.pop(str(job_id), None)
+        tmp = NOTES_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(notes, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, NOTES_PATH)
+        return per
 
 
 # ---------------------------------------------------------------- refresh
@@ -183,6 +210,8 @@ def bench_loop():
     while True:
         for cl in CONFIG["clusters"]:
             name = cl["name"]
+            if not cl.get("bench", name == "DeltaAI"):   # Simon: only DeltaAI is benchmarked
+                continue
             last = BENCH.get(name, {}).get("generated", 0)
             if time.time() - last < 20 * 3600 or name not in LAST_SEC:
                 continue
@@ -233,6 +262,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"clusters": [dict(STATE.get(c["name"], {"name": c["name"], "alias": c["alias"]}),
                                                       bench=BENCH.get(c["name"]), bench_status=BENCH_STATUS.get(c["name"]))
                                                  for c in CONFIG["clusters"]],
+                                    "notes": load_notes(),
                                     "refresh_minutes": CONFIG["refresh_minutes"], "server_time": time.time()})
         return self._send(404, {"error": "not found"})
 
@@ -251,6 +281,8 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/api/login" and cl:
             open_login(cl["alias"])
             return self._send(200, {"ok": True})
+        if self.path == "/api/note" and cl and body.get("id"):
+            return self._send(200, {"ok": True, "notes": save_note(name, body["id"], body.get("text", ""))})
         if self.path == "/api/whatif" and cl:
             try:
                 return self._send(200, whatif(name, body["partition"], int(body["gpus"]), float(body["hours"])))

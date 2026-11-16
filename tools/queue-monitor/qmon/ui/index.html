@@ -90,6 +90,12 @@ main { max-width: 980px; margin: 0 auto; padding: 22px 24px 64px; }
 .state.pend { background: transparent; border: 2px solid var(--amber); }
 .state.other { background: var(--text-3); }
 .jname { font-size: 14px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.jnote { font-size: 12px; color: var(--accent); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 1px; }
+textarea.jnote-edit { display: block; width: 100%; box-sizing: border-box; min-height: 52px; resize: vertical; margin: 2px 0 12px;
+  font: 13px/1.45 inherit; font-family: inherit; padding: 7px 10px; border-radius: 8px; border: 1px solid var(--line);
+  background: var(--fill); color: var(--text); }
+textarea.jnote-edit:focus { outline: none; border-color: var(--accent); background: var(--card); }
+.notehint { font-size: 11px; color: var(--text-3); margin: -8px 0 10px; height: 14px; }
 .jmeta { font-size: 12px; color: var(--text-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .when { text-align: right; }
 .when .big { font-size: 15px; font-weight: 600; }
@@ -153,6 +159,27 @@ th { color: var(--text-2); font-weight: 500; border-top: 0; }
 let STATE = null, CUR = null;
 const WI = {};  // what-if inputs and result per cluster, kept across re-renders
 const OPEN = new Set();
+const DRAFT = {};  // unsaved note text per "cluster|job id", kept across re-renders
+const SAVE_T = {};
+function noteKey(c, id) { return c.name + "|" + id; }
+function noteOf(c, id) {
+  const k = noteKey(c, id);
+  if (k in DRAFT) return DRAFT[k];
+  return ((STATE.notes || {})[c.name] || {})[id] || "";
+}
+async function saveNote(c, id) {
+  const k = noteKey(c, id);
+  if (!(k in DRAFT)) return;
+  const text = DRAFT[k];
+  const hint = document.getElementById("nh-" + id);
+  try {
+    const r = await post("/api/note", {cluster: c.name, id, text});
+    STATE.notes = STATE.notes || {};
+    STATE.notes[c.name] = r.notes || {};
+    if (DRAFT[k] === text) delete DRAFT[k];
+    if (hint) { hint.textContent = "已保存"; setTimeout(() => { if (hint.textContent === "已保存") hint.textContent = ""; }, 1500); }
+  } catch (e) { if (hint) hint.textContent = "保存失败，稍后会再试"; }
+}
 const $ = (s, el = document) => el.querySelector(s);
 const esc = s => String(s == null ? "" : s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 const WD = "日一二三四五六";
@@ -219,8 +246,11 @@ function render() {
   h += leaderboard(c);
   h += history(c);
   h += notes(c);
+  const fa = document.activeElement, keep = fa && fa.classList && fa.classList.contains("jnote-edit")
+    ? {id: fa.id, a: fa.selectionStart, b: fa.selectionEnd, top: fa.scrollTop} : null;
   $("#main").innerHTML = h;
   bind(c);
+  if (keep) { const t = document.getElementById(keep.id); if (t) { t.focus(); t.setSelectionRange(keep.a, keep.b); t.scrollTop = keep.top; } }
   if (jobs.length) drawTimeline(c, jobs);
   jobs.forEach(j => { if (OPEN.has(j.id)) drawDetail(c, j); });
 }
@@ -268,7 +298,7 @@ function jobRow(c, j) {
   }
   return `<div class="job ${open ? "open" : ""}" data-id="${esc(j.id)}">
     <div class="jobrow"><span class="state ${cls}"></span>
-      <div><div class="jname">${esc(j.name)}</div><div class="jmeta">${meta}</div></div>
+      <div style="min-width:0"><div class="jname">${esc(j.name)}</div><div class="jmeta">${meta}</div>${noteOf(c, j.id) ? `<div class="jnote">${esc(noteOf(c, j.id).split("\n")[0])}</div>` : ""}</div>
       ${right}
       <svg class="chev" width="10" height="10" viewBox="0 0 10 10"><path d="M3 1.5 6.5 5 3 8.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
     </div>
@@ -277,7 +307,8 @@ function jobRow(c, j) {
 
 function detailHTML(c, j) {
   const fact = (k, v) => `<div class="fact"><div class="k">${k}</div><div class="v num">${v}</div></div>`;
-  let h = `<div class="facts">`;
+  let h = `<textarea class="jnote-edit" id="n-${esc(j.id)}" data-id="${esc(j.id)}" placeholder="备注：这个实验是做什么的（自动保存）">${esc(noteOf(c, j.id))}</textarea><div class="notehint" id="nh-${esc(j.id)}"></div>`;
+  h += `<div class="facts">`;
   if (j.state === "PENDING") {
     const sp = j.sprio;
     h += fact("现在的优先级", `${Math.round(j.prio)}${sp ? ` <small>份额 ${Math.round(sp.fs)} · 等待 ${Math.round(sp.age)} · 分区 ${Math.round(sp.part)}</small>` : ""}`);
@@ -309,6 +340,11 @@ function bind(c) {
     el.classList.toggle("open");
     const j = c.jobs.find(x => x.id === id);
     if (OPEN.has(id) && j) drawDetail(c, j);
+  });
+  document.querySelectorAll("textarea.jnote-edit").forEach(t => {
+    const id = t.dataset.id, k = noteKey(c, id);
+    t.oninput = () => { DRAFT[k] = t.value; clearTimeout(SAVE_T[k]); SAVE_T[k] = setTimeout(() => saveNote(c, id), 800); };
+    t.onblur = () => { clearTimeout(SAVE_T[k]); saveNote(c, id); };
   });
   const go = $("#wi-go");
   if (go) go.onclick = async () => {
@@ -518,7 +554,7 @@ function leaderboard(c) {
 }
 function history(c) {
   if (!c.history.length) return "";
-  const rows = c.history.slice(0, 30).map(r => `<tr><td>${esc(r.name)}</td><td>${esc(r.partition)}</td><td class="num">${r.gpus || "—"}</td>
+  const rows = c.history.slice(0, 30).map(r => `<tr><td>${esc(r.name)}${r.id && noteOf(c, r.id) ? `<div class="jnote" style="max-width:260px">${esc(noteOf(c, r.id))}</div>` : ""}</td><td>${esc(r.partition)}</td><td class="num">${r.gpus || "—"}</td>
     <td>${esc(r.state.split(" ")[0].toLowerCase())}</td><td class="num">${r.submit ? when(r.submit, c.now) : "—"}</td>
     <td class="num">${r.start && r.eligible ? dur(r.start - r.eligible, true) : "—"}</td><td class="num">${esc(r.elapsed)}</td></tr>`).join("");
   return `<details class="more"><summary>最近 14 天的任务</summary><div class="card" style="overflow-x:auto"><table>
