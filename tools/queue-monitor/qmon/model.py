@@ -574,6 +574,15 @@ def predict(snap, cfg, calibration=None, extra_jobs=()):
             for jid, s in starts.items():
                 res.setdefault(jid, {})[scen] = s
         for jid, v in res.items():
+            # Scenarios interact (your own earlier starts add usage), so the
+            # fast run can occasionally land later than the typical one. Keep
+            # the range ordered: fast <= typical <= slow.
+            ty = v.get("typical")
+            if ty is not None:
+                if v.get("fast") is None or v["fast"] > ty:
+                    v["fast"] = ty
+                if v.get("slow") is not None and v["slow"] < ty:
+                    v["slow"] = ty
             adj = {}
             for scen, s in v.items():
                 adj[scen] = None if s is None else snap["now"] + (s - snap["now"]) * cal
