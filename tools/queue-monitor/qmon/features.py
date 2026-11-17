@@ -33,7 +33,7 @@ def hist_jobs_from_snap(snap):
     return out
 
 
-def compute(snap, cfg, allp, hist_jobs, only=None):
+def compute(snap, cfg, allp, hist_jobs, only=None, prev=None):
     """{job id: feature dict} for every pending job that the rule simulation placed.
 
     allp: model.predict(..., log_all=True)["all"]; hist_jobs: list of recent jobs
@@ -97,8 +97,23 @@ def compute(snap, cfg, allp, hist_jobs, only=None):
             lim_obs.setdefault(key, []).append((h["start"] - h["elig"], 1))
         elif h["start"] is not None or h["end"] is None or h["end"] > T:
             lim_obs.setdefault(key, []).append((T - h["elig"], 0))
+    # cut line: priorities (aged to now) of jobs that were pending at T_prev and started since
+    cut = None
+    if prev:
+        t_prev, pp = prev
+        started = {}
+        for h in snap["history"]:
+            if t_prev < h["start"] <= T:
+                started[h["id"]] = h["start"]
+        for r in snap["running"]:
+            if r.get("start") and t_prev < r["start"] <= T:
+                started[r["id"]] = r["start"]
+        age_rate = W["age"] / (W["max_age_s"] / 3600.0)
+        cut = sorted(min(p + age_rate * (started[jid] - t_prev) / 3600.0, p + W["age"]) for jid, p in pp.items()
+                     if jid in started)
     lim_cache = {}
     out = {}
+    lt = time.localtime(T)
     for j in snap["pending"]:
         if only is not None and j["id"] not in only:
             continue
@@ -154,6 +169,15 @@ def compute(snap, cfg, allp, hist_jobs, only=None):
             "lh50": (lq[1] / 3600.0 if lq and lq[1] is not None else None),
             "lh90": (lq[2] / 3600.0 if lq and lq[2] is not None else None),
         }
+        f["hour"] = lt.tm_hour + lt.tm_min / 60.0
+        f["wday"] = lt.tm_wday
+        if cut:
+            q10, q50 = cut[len(cut) // 10], cut[len(cut) // 2]
+            f.update({"n_started6": len(cut), "cut_q10": q10, "cut_q50": q50, "d_prio_q10": j["prio"] - q10,
+                      "d_prio_q50": j["prio"] - q50, "below_cut": sum(1 for c in cut if c < j["prio"]) / float(len(cut))})
+        else:
+            f.update({"n_started6": 0 if prev else None, "cut_q10": None, "cut_q50": None, "d_prio_q10": None,
+                      "d_prio_q50": None, "below_cut": None})
         f["u_eta"] = (f["u_ahead_n"] + 1) / (f["u_st24"] / 24.0 + 0.05)
         f["a_eta"] = (f["a_ahead"] + 1) / (f["a_st24"] / 24.0 + 0.05) if f["a_ahead"] is not None else None
         out[j["id"]] = f

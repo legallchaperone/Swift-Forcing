@@ -25,6 +25,7 @@ def _setup(args, config):
     A, cfg, HPATH = args, config, args.sacct
 
 
+PREV_H = 6.0     # the cut line looks at jobs that started in the last 6 hours
 SNAP0 = None
 JOBS = None
 JBP = None
@@ -84,7 +85,10 @@ def feats_at(T):
     if not snap["pending"]:
         return []
     pr = model.predict(snap, cfg, log_all=True)
-    fts = features.compute(snap, cfg, pr["all"], JOBS)
+    T_prev = T - PREV_H * 3600
+    sp = bench.reconstruct(T_prev, JOBS, tree, weights, part_w, SNAP0["me"])
+    prev = (T_prev, {x["id"]: x["prio"] for x in sp["pending"]})
+    fts = features.compute(snap, cfg, pr["all"], JOBS, prev=prev)
     rows = []
     lt = time.localtime(T)
     for j in snap["pending"]:
