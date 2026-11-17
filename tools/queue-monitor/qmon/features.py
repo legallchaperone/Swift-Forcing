@@ -33,6 +33,24 @@ def hist_jobs_from_snap(snap):
     return out
 
 
+PREV_H = 6.0     # the cut line looks at jobs that started in the last 6 hours
+
+
+def prev_of(snap):
+    """(time, {pending job id: priority}) of a snapshot, to pass later as `prev`."""
+    return snap["now"], {j["id"]: j["prio"] for j in snap["pending"]}
+
+
+def pick_prev(cands, T, tol_h=1.5):
+    """The (time, prios) entry closest to T - PREV_H hours, or None if none is within tol_h."""
+    best = None
+    for c in cands:
+        d = abs(c[0] - (T - PREV_H * 3600))
+        if d <= tol_h * 3600 and (best is None or d < best[0]):
+            best = (d, c)
+    return best[1] if best else None
+
+
 def compute(snap, cfg, allp, hist_jobs, only=None, prev=None):
     """{job id: feature dict} for every pending job that the rule simulation placed.
 
@@ -108,9 +126,17 @@ def compute(snap, cfg, allp, hist_jobs, only=None, prev=None):
         for r in snap["running"]:
             if r.get("start") and t_prev < r["start"] <= T:
                 started[r["id"]] = r["start"]
+        # a live squeue line "123_[4-100]" stands for tasks that start later as "123_4", ...
+        rng = {jid.split("_")[0]: p for jid, p in pp.items() if "[" in jid}
         age_rate = W["age"] / (W["max_age_s"] / 3600.0)
-        cut = sorted(min(p + age_rate * (started[jid] - t_prev) / 3600.0, p + W["age"]) for jid, p in pp.items()
-                     if jid in started)
+        cut = []
+        for jid, st in started.items():
+            p = pp.get(jid)
+            if p is None and rng and "_" in jid:
+                p = rng.get(jid.split("_")[0])
+            if p is not None:
+                cut.append(min(p + age_rate * (st - t_prev) / 3600.0, p + W["age"]))
+        cut.sort()
     lim_cache = {}
     out = {}
     lt = time.localtime(T)

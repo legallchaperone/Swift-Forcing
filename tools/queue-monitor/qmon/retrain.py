@@ -64,11 +64,13 @@ def run(cl, fetch=True, log=print):
         raise RuntimeError("learn failed: %s" % r.stderr.decode()[-500:])
     os.replace(out + ".tmp", out)
     log(r.stdout.decode().strip())
-    # time-split study: weeks 2-7 before the fetch (the last week has unfinished waits), each week predicted by models trained only on earlier weeks
+    # time-split study: weeks 2-7 before the fetch (the last week has unfinished waits), each week predicted by
+    # models trained only on earlier weeks; ranges at most 24 hours wide, as the app shows them
     study = os.path.join(bdir, "%s_study.json" % name)
-    r = subprocess.run([VENV_PY, "-m", "qmon.study", table, "--folds", "2,3,4,5,6,7", "--fold-days", "7",
-                        "--models", "rule,cal2,mix3", "--json", study + ".tmp"], cwd=ROOT, capture_output=True,
-                       timeout=3600, env=dict(os.environ, PYTHONPATH=ROOT))
+    r = subprocess.run([VENV_PY, "-m", "qmon.study", table, "--folds", "2,3,4,5,6,7", "--fold-days", "7", "--hgb",
+                        "--models", "rule,cal2,learned,haz+", "--modes", "best24", "--json", study + ".tmp"],
+                       cwd=ROOT, capture_output=True,
+                       timeout=4 * 3600, env=dict(os.environ, PYTHONPATH=ROOT))
     if r.returncode == 0:
         os.replace(study + ".tmp", study)
     else:

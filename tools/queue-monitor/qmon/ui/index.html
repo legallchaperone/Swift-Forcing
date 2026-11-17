@@ -532,6 +532,29 @@ function lbTable(overall, algos) {
   return `<table><tr><th>算法（按综合分排序）</th><th>中位误差</th><th>中位偏差倍数</th><th>区间命中（目标 80%）</th><th>综合分（越小越好）</th></tr>${rows}</table>`;
 }
 function studyTable(st) {
+  if (st.kind === "capped") return cappedTable(st);
+  return oldStudyTable(st);
+}
+function cappedTable(st) {
+  const r = {}; Object.entries(st.results).forEach(([k, v]) => { r[k.split("|")[0]] = v; });
+  const order = ["haz+", "learned", "cal2", "rule"].filter(a => r[a]);
+  const name = {"haz+": ["学习模型（风险模型）", "现在在用"], learned: ["上一版学习模型", "以前在用"],
+    cal2: ["规则模型 + 分组校准", "更早在用"], rule: ["规则模型", "不校准"]};
+  const pct = v => v == null ? "—" : Math.round(v * 100) + "%";
+  const rows = order.map(a => { const o = r[a], hb = o.hit_by || {};
+    return `<tr><td><b style="font-weight:${a === "haz+" ? 600 : 500}">${name[a][0]}</b><div class="jmeta">${name[a][1]}</div></td>
+      <td class="num">${dur(o.med_err * 3600, true)}</td><td class="num">${dur(o.mean_err * 3600, true)}</td>
+      <td class="num">${pct(o.hit)}</td><td class="num">${dur(o.width * 3600, true)}</td>
+      <td class="num">${dur(o.u_med_err * 3600, true)} · ${pct(o.u_hit)}</td>
+      <td class="num">${["<6h", "6-24h", "1-3d", ">3d"].map(k => pct(hb[k])).join(" · ")}</td></tr>`; }).join("");
+  const n = r[order[0]] ? r[order[0]].n : 0;
+  return `<table><tr><th>算法</th><th>中位误差</th><th>平均误差</th><th>区间命中</th><th>区间平均宽</th><th>每个用户同权<br><small>误差 · 命中</small></th>
+    <th>按实际等待分档的命中<br><small>&lt;6h · 6–24h · 1–3d · &gt;3d</small></th></tr>${rows}</table>
+    <div class="note">区间最长 ${st.cap_h} 小时（±${st.cap_h / 2} 小时）。${day(st.span[1] - 7 * 86400 * Math.max(...st.folds))} 起的 ${st.folds.length} 周，每周都只用更早的数据训练，再预测这一周（共 ${n.toLocaleString()} 次预测）。
+    要等一天以上的任务很难落进 24 小时的区间，所以命中率主要看等待短的任务。
+    「每个用户同权」：一个人排了几百个任务时，这些任务合起来只算一份，更接近单个任务的体验。</div>`;
+}
+function oldStudyTable(st) {
   const r = st.results, order = ["learned", "cal2", "rule"].filter(a => r[a]);
   const name = {learned: ["学习模型", "现在在用"], cal2: ["规则模型 + 分组校准", "以前在用"], rule: ["规则模型", "不校准"]};
   const pct = v => v == null ? "—" : Math.round(v * 100) + "%";
@@ -585,7 +608,9 @@ function notes(c) {
     公平份额按 Slurm 的 Fair Tree 规则模拟，使用量每 ${Math.round(c.weights.half_life_s / 3600)} 小时减半。集群按过去 3 天的速度放行，优先级高的先走。
     时间范围的两端对应集群放行快和慢的时候。<br><br>${pools}<br>
     模型算出的公平份额和 Slurm 的平均差 ${c.model_check != null ? c.model_check.toFixed(4) : "—"}。
-    <br><br><b>校准</b>：应用每次刷新都会记下全集群排队任务的预测，任务真正开始后就知道预测差了多少。
+    <br><br><b>学习模型</b>：有训练好的模型时，你的任务用它的预测。它根据排队位置、前面还有多少同类任务、最近 6 小时放行到哪个优先级等信息，
+    算出任务在每个时间段开始的概率。「最可能」是中位数；「最早」到「最晚」是概率最集中的一段，最长 24 小时。每周用最近 60 天的记录重训一次。
+    <br><br><b>校准</b>（没有学习模型时）：应用每次刷新都会记下全集群排队任务的预测，任务真正开始后就知道预测差了多少。
     按「预测还要等多久」分组，用真实等待把预测修正成一个区间：真实开始时间有 80% 的机会落在「最早」和「最晚」之间。
     还没开始的任务也算进去（只知道它至少等了多久）。每组至少要有 ${40} 个已开始的任务才启用校准，之前用集群放行快慢的模拟给范围。
     ${accTable(a)}</div></details>`;

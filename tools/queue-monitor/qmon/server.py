@@ -76,13 +76,45 @@ def load_models():
             MODELS[cl["name"]] = m
 
 
+PREVS = {}        # cluster name -> [(time, {pending job id: priority})] of the last hours
+
+
+def prev_for(name, cl, now):
+    """The queue about 6 hours ago (for the cut-line features): from memory, else from the archive."""
+    p = features.pick_prev(PREVS.get(name, []), now)
+    if p:
+        return p
+    target = now - features.PREV_H * 3600
+    best = None
+    for path in archive.list_snapshots(DATA_DIR, name):
+        try:
+            t = int(os.path.basename(path)[5:-8])
+        except ValueError:
+            continue
+        if abs(t - target) <= 1.5 * 3600 and (best is None or abs(t - target) < best[0]):
+            best = (abs(t - target), path)
+    if not best:
+        return None
+    try:
+        p = features.prev_of(model.parse_snapshot(archive.load(best[1]), cl))
+    except Exception:
+        traceback.print_exc()
+        return None
+    PREVS.setdefault(name, []).append(p)
+    return features.pick_prev(PREVS[name], now)
+
+
 def apply_learned(name, cl, snap, preds):
-    """Replace the range of each of my pending jobs by the learned model's 10/50/90% range."""
+    """Replace the range of each of my pending jobs by the learned model's range (at most 24 hours)."""
+    now = snap["now"]
+    prev = prev_for(name, cl, now)
+    PREVS[name] = sorted([x for x in PREVS.get(name, []) if x[0] > now - 9 * 3600] + [features.prev_of(snap)],
+                         key=lambda x: x[0])
     m = MODELS.get(name)
     if not m or not preds["jobs"]:
         return
-    feats = features.compute(snap, cl, preds["all"], features.hist_jobs_from_snap(snap), only=set(preds["jobs"]))
-    now = snap["now"]
+    feats = features.compute(snap, cl, preds["all"], features.hist_jobs_from_snap(snap), only=set(preds["jobs"]),
+                             prev=prev)
     for jid, p in preds["jobs"].items():
         f = feats.get(jid)
         q = m.predict(f) if f else None

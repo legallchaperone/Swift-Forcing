@@ -444,10 +444,13 @@ def run_live(cfg_cluster, data_dir, jobs, fetched_at, guard_d, live_guard_d=2):
     algos = ["slurm", "rule", "rule-static"] + (["learned", "slurm@learned"] if lm else [])
     rows = {a: [] for a in algos}
     n_snaps = 0
+    prevs = []
     for path in archive.list_snapshots(data_dir, cfg_cluster["name"]):
         sec = archive.load(path)
         snap = model.parse_snapshot(sec, cfg_cluster)
         T = snap["now"]
+        prev = features.pick_prev(prevs, T)
+        prevs = [x for x in prevs if x[0] > T - 9 * 3600] + [features.prev_of(snap)]
         if T > fetched_at - live_guard_d * 86400:
             continue
         n_snaps += 1
@@ -462,7 +465,8 @@ def run_live(cfg_cluster, data_dir, jobs, fetched_at, guard_d, live_guard_d=2):
                 and j["id"] in truth and truth[j["id"]][0] is not None}
         lf = {}
         if lm and T > lm_after:
-            lf = features.compute(snap, cfg_cluster, pr["all"], features.hist_jobs_from_snap(snap), only=want)
+            lf = features.compute(snap, cfg_cluster, pr["all"], features.hist_jobs_from_snap(snap), only=want,
+                                  prev=prev)
         for j in snap["pending"]:
             if j["id"] not in want or j["id"] not in rule or j["id"] not in static:
                 continue
